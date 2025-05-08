@@ -173,11 +173,10 @@ CONVERTABLE_DICT = {
     "questionable" : ["nsfw", "with partial nudity", "questionable", "questionable content"],
     "explicit" : ["explicit", "nsfw", "with nudity", "adult content", "explicit material"],
 }
+CHAR_COOCCURRENCE_DROPOUT = {}
 if os.path.exists('character_cooccurrence_sigmoid.json'):
     with open('character_cooccurrence_sigmoid.json', 'r', encoding='utf-8') as f:
         CHAR_COOCCURRENCE_DROPOUT = json.load(f)
-else:
-    CHAR_COOCCURRENCE_DROPOUT = {}
 
 popular_chars_names = ["momiji", "character", "futo", "inaba", "yor", "seija", "stout", "sakuya", "yazawa", "tamamo", "ellen", "d'arc", "murasa", "misaka", "hearn", "kisaragi", "kaku", "ichinose", "hatate", "suwako", "douji", "aqua", "yoko", "samidare", "kikuchi", "nilou", "yuyuko", "sekibanki", "asashio", "rumia", "megurine", "kotori", "formidable", "frieren", "satori", "shijou", "kyrielight", "kanako", "remilia", "koakuma", "gardevoir", "littner", "princess", "d.va", "saber", "higuchi", "koishi", "bridget", "minami", "inkling", "monster", "kokomi", "miho", "kasodani", "houraisan", "kongou", "artoria", "chen", "pyra", "patchouli", "konpaku", "tojo", "mercury", "shinobu", "tewi", "suika", "izumi", "shiroko", "inazuma", "kurodani", "akemi", "fujiwara", "mononobe", "kokoro", "nagae", "azusa", "youmu", "oma", "kafka", "c.c.", "arisu", "abigail", "mae", "yumemi", "manhattan", "mona", "shirakami", "zhongli", "shibuya", "kawashiro", "kaenbyou", "zero", "nakano", "yuudachi", "tao", "eula", "hoshimachi", "kasen", "raiden", "yuugi", "takane", "murakumo", "hoshii", "watanabe", "rio", "minamoto", "kaname", "minato", "pendragon", "williams", "udongein", "shower", "super", "ryuuko", "himekaidou", "mirko", "cammy", "sayaka", "riamu", "reimu", "yasaka", "komeiji", "nightbug", "tachyon", "kokichi", "lumine", "utsuho", "rem", "tatsumaki", "shimamura", "sonoda", "takagaki", "shenhe", "kagerou", "miki", "houjuu", "lillie", "nagato", "senketsu", "amami", "player", "byakuren", "junko", "asuna", "kashima", "komachi", "kinomoto", "power", "kagamine", "kirisame", "kogasa", "sanae", "souji", "nico", "seiga", "mokou", "aran", "iono", "usami", "nazrin", "akiyama", "kamisato", "joe", "miku", "nozomi", "shooter", "nahida", "luka", "mythra", "claudius", "kyoko", "yagokoro", "iku", "aya", "kaede", "takina", "morrigan", "amiya", "gokou", "yoshika", "suzuya", "dawn", "kamishirasawa", "shuten", "okita", "joseph", "reisalin", "ruri", "haruka", "nitori", "marnie", "plana", "renko", "shameimaru", "samus", "makoto", "holo", "doll", "yuuka", "hinanawi", "hatsune", "shiranui", "daiyousei", "kanzaki", "magician", "rembran", "reiuji", "jougasaki", "tohsaka", "maki", "ibuki", "karin", "kai", "white", "oshino", "koharu", "bowsette", "eiki", "toki", "ayaka", "cafe", "sagiri", "yelan", "zeppeli", "zelda", "wriggle", "hata", "ganaha", "saigyouji", "shimakaze", "mayuzumi", "shogun", "lorelei", "einzbern", "fuyuko", "knowledge", "sonico", "tifa", "rensouhou-chan", "rin", "kyouko", "kaguya", "serval", "nino", "ranko", "madoka", "flandre", "kisaki", "hong", "illyasviel", "koume", "hamakaze", "chun-li", "miko", "oyama", "shanghai", "joestar", "uzuki", "umi", "yui", "kaga", "tomoe", "mika", "mash", "ganyu", "ibaraki", "fubuki", "miorine", "dark", "ayanami", "arona", "2b", "boo", "eirin", "kazusa", "mio", "aensland", "anthonio", "von", "meiling", "parsee", "tachibana", "warrior", "kitagawa", "fumika", "marine", "yamame", "alter", "marisa", "rikka", "megumin", "moriya", "sparkle", "nishizumi", "matoi", "takao", "raikou", "briar", "minamitsu", "rei", "imaizumi", "asuka", "kazami", "hk416", "shiki", "nero", "keine", "amatsukaze", "karyl", "hina", "chino", "mari", "nanami", "izayoi", "yae", "onozuka", "nishikigi", "nishikino", "yamato", "makima", "suigintou", "sagisawa","mizuhashi", "yotsuba", "chiaki", "margatroid", "ushio", "mikoto", "ayase", "mai", "hitori", "venti", "agnes", "scathach", "yoimiya", "gawr", "sagume", "ooyodo", "reisen", "chihaya", "haruhi", "gumi", "akagi", "souryuu", "hirasawa", "homura", "shigure", "hibiki", "yuzuki", "acheron", "link", "sakura", "ryuujou", "atago", "inubashiri", "mami", "nue", "yukari", "eugen", "jeanne", "gura", "firefly", "hestia", "anchovy", "haruna", "aru", "houshou", "gotoh", "akatsuki", "kishin", "alice", "kijin", "hijiri", "kagiyama", "yakumo", "suisei", "ro-500", "keqing", "testarossa", "scarlet", "iowa", "suletta", "tenshi", "langley", "lockhart", "tatara", "mystia", "adachi", "rosa", "hoshiguma", "yuki", "hakurei", "furina", "daiwa", "mahiro", "aris", "suzumiya", "kochiya", "inoue", "fate", "nami", "hunter", "tenryuu", "shirasaka", "astolfo", "caesar", "prinz", "marin", "toyosatomimi", "kafuu", "takarada", "hoshino", "clownpiece", "cynthia", "miyako", "darjeeling", "sangonomiya", "chisato", "rice", "ikazuchi", "cirno", "maribel", "mizumiya", "niko", "kikirara", "riona"]
 no_dropout_tokens = [
@@ -407,6 +406,23 @@ def decrypt_json_file(encrypted_file, password):
     # Return the JSON data
     return json_data
 SKIP_PATH_CHECK = False
+
+def dropout_copyright_or_year(tokens):
+    selected = []
+    for token in tokens:
+        if "copyright" in token or "year" in token or "series" in token:
+            if random.random() > 0.1:
+                continue
+        if "meta" in token:
+            if random.random() > 0.05:
+                continue
+        if "normal quality" in token:
+            if random.random() > 0.01:
+                continue
+        else:
+            selected.append(token)
+    return selected
+
 def dropout_coocurrence(tokens):
     assert isinstance(tokens, list), "tokens should be a list"
     #CHAR_COOCCURRENCE_DROPOUT
@@ -443,8 +459,12 @@ def dropout_coocurrence(tokens):
         else:
             selected.append(token)
     for token, prob in merged_dict.items():
+        if any(t in token for t in no_dropout_tokens):
+            selected.append(token)
+            continue
         if random.random() > prob:
             selected.append(token)
+    selected = dropout_copyright_or_year(selected)
     log_every(f"CHAR_COOCCURRENCE_DROPOUT: {selected}, char_tags : {char_tags}", 25)
     return selected
 def set_skip_path_check(skip):
@@ -787,7 +807,7 @@ class BaseSubset:
                     info_file = self.metadata_file
                 else:
                     info_file = self.image_dir
-                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}", 1000)
+                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}", 100)
                 # tag is dropped
                 pass
         if shuffle:
@@ -1249,8 +1269,15 @@ class BaseDataset(torch.utils.data.Dataset):
                     if random.random() < 0.03:
                         # add random alphanum (5~10 characters)
                         l.append(create_very_random_alphanumeric(random.randint(5, 10)))
+                    if random.random() < 0.03:
+                        # add "photo" / "cosplay photo" / "real" tag to contaminate randomly
+                        tag_randomly_selected = random.choice(["photo", "cosplay photo", "real"])
+                        if tag_randomly_selected not in l:
+                            l.append(tag_randomly_selected)
                     # for tokens, randomly capitalize or uncapitalize first letter
                     for i, token in enumerate(l):
+                        if token.startswith("pixiv_"):
+                            token = token.replace("pixiv_", "artist:")
                         if random.random() < 0.1:
                             if random.random() < 0.1:
                                 l[i] = token.capitalize()
@@ -1268,6 +1295,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 #    random.shuffle(flex_tokens)
                 flex_tokens = dropout_coocurrence(flex_tokens)
                 flex_tokens = dropout_tags(flex_tokens)
+                flex_tokens = dropout_copyright_or_year(flex_tokens)
                 fixed_tokens, flex_tokens = convert_tags_if_needed(fixed_tokens), convert_tags_if_needed(flex_tokens)
                 # by random chance, use different join
                 if random.random() < 0.5:
@@ -1522,6 +1550,10 @@ class BaseDataset(torch.utils.data.Dataset):
             return
 
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
+        if not batches:
+            logger.info("no batches to cache.")
+            return
+        logger.info(f"number of batches: {len(batches)}")
         logger.info("caching latents...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
             cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.random_crop)
@@ -3395,7 +3427,13 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         default="",
         help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, AdaFactor",
     )
-
+    group = parser.add_argument_group("first‑step regulariser")
+    group.add_argument("--first_step_reg", action="store_true",
+                    help="Activate colour‑collapse regulariser on the highest‑noise timestep")
+    group.add_argument("--reg_threshold", type=float, default=1.0,
+                    help="Latent magnitude threshold for x0 prediction (|x0| > thresh is penalised)")
+    group.add_argument("--reg_penalty_strength", type=float, default=0.1,
+                    help="Coefficient λ multiplying the squared‑excess penalty")
     # backward compatibility
     parser.add_argument(
         "--use_8bit_adam",
