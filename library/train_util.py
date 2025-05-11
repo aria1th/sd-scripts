@@ -34,7 +34,9 @@ from tqdm import tqdm
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
-
+from itertools import islice
+from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
 
@@ -288,6 +290,31 @@ def convert_tags_if_needed(tags):
     return converted
 
 # region dataset
+
+def _chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            break
+        yield chunk
+
+def _worker(captions_chunk, valid_triggers):
+    local_caption_per_tag = Counter()
+    local_tag_frequency = defaultdict(Counter)
+
+    for caption in captions_chunk:
+        tags = [t.strip().lower() for t in caption.split(",") if t.strip()]
+        triggers = [m.group(1).strip() for m in CHAR_RE.finditer(caption)]
+        for trig in triggers:
+            if trig not in valid_triggers:
+                continue
+            local_caption_per_tag[trig] += 1
+            local_tag_frequency[trig].update(tags)
+
+    return local_caption_per_tag, local_tag_frequency
+
+CHAR_RE = re.compile(r'character:([^,]+)', flags=re.I)
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
@@ -718,34 +745,68 @@ class BaseSubset:
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
         self.img_count = 0
-        self.dropout_prob = {}
-        self.tag_frequency = {}
+        self.dropout_prob = defaultdict(dict) # {trigger: {tag: dropout_prob}}
+        self.tag_frequency = defaultdict(Counter) # {trigger: {tag: count}}
+        self.caption_per_tag = defaultdict(int) # {trigger: count}
         self.min_dropout_rate = min_adaptive_dropout
         self.max_dropout_rate = max_adaptive_dropout
-        self.trigger_token = adaptive_dropout_trigger_token
+        self.trigger_token = [a.strip() for a in adaptive_dropout_trigger_token.split(",")] if adaptive_dropout_trigger_token else None
         self.adaptive_dropout = adaptive_dropout
 
     def set_tag_frequency(self, captions):
         """
         Recalculates dropout probabilities.
         """
-        # Track how many lines/captions we've processed for this directory
-        self.tag_frequency["__total_captions__"] = self.tag_frequency.get(
-            "__total_captions__", 0
-        ) + len(captions)
-
-        for caption in captions:
-            for tag in caption.split(","):
-                tag = tag.strip()
-                if tag:
-                    tag = tag.lower()
-                    frequency = self.tag_frequency.get(tag, 0)
-                    self.tag_frequency[tag] = frequency + 1
-
-        # After updating frequencies, recalculate dropout probabilities
-        self.dropout_prob = {}
+        if self.trigger_token is None:
+            if not self.adaptive_dropout:
+                # No trigger token, so we don't need to do anything
+                return
+            else:
+                logger.warning("Adaptive dropout is enabled but no trigger token is provided. Automatically finding character: tokens with 5 < occurrence < 500")
+                # Find all character: tokens in the captions
+                self.trigger_token = {} # trigger -> count
+                for caption in captions:
+                    for tag in caption.split(","):
+                        tag = tag.strip()
+                        if tag.startswith("character:"):
+                            char_name = tag.split("character:")[1].strip()
+                            self.trigger_token[char_name] = self.trigger_token.get(char_name, 0) + 1
+                # Filter out tokens with occurrence < 500
+                self.trigger_token = [k for k, v in self.trigger_token.items() if v <= 500 and v >= 5]
+                logger.info(f"Found trigger tokens: {len(self.trigger_token)}")
+        
+        self.parallel_count(captions, workers=12)
+        trigger_to_caption = defaultdict(list)
+        self.dropout_prob = defaultdict(dict)
         self.calculate_dropout_prob()
+    def parallel_count(self, captions, workers=None, chunk_size=10_000):
+        """
+        Parallel replacement for the sequential loop that populates
+        self.caption_per_tag and self.tag_frequency.
+        """
+        valid = frozenset(self.trigger_token)
+        caption_chunks = list(_chunked(captions, chunk_size))
 
+        # ---- launch workers ----
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            # Map each future back to its chunk length so we know how much to update by
+            future_to_len = {
+                pool.submit(_worker, chunk, valid): len(chunk)
+                for chunk in caption_chunks
+            }
+
+            # ---- merge results with a live progress-bar ----
+            self.caption_per_tag.clear()
+            self.tag_frequency.clear()
+
+            with tqdm(total=len(captions), desc="Counting captions") as pbar:
+                for fut in as_completed(future_to_len):
+                    cap_cnt, tag_freq = fut.result()            # get partial result
+                    self.caption_per_tag.update(cap_cnt)
+                    for trig, cnt in tag_freq.items():
+                        self.tag_frequency[trig].update(cnt)
+
+                    pbar.update(future_to_len[fut])             # advance bar
     def calculate_dropout_prob(self):
         """
         Compute dropout probabilities for each directory and each tag
@@ -754,56 +815,61 @@ class BaseSubset:
         A tag that appears in 0% of captions (theoretically not in the data anyway) => ~min_dropout_rate.
         For intermediate frequencies, do a linear interpolation between min_dropout_rate and max_dropout_rate.
         """
-        total_captions = self.tag_frequency.get("__total_captions__", 0)
-        
         # Controls how steep the sigmoid is around the center
         alpha = 10.0
         # The ratio value around which the sigmoid will transition from low to high
         center = 0.85
-        
-        for tag, count in self.tag_frequency.items():
-            if tag == "__total_captions__":
+        if self.trigger_token is None:
+            # No trigger token, so we don't need to do anything
+            return
+        for trigger in self.trigger_token:
+            total_captions = self.caption_per_tag.get(trigger, 0)
+            if total_captions == 0:
                 continue
+            for tag, count in self.tag_frequency[trigger].items():
+                ratio = count / total_captions if total_captions != 0 else 0.0
 
-            ratio = count / total_captions if total_captions != 0 else 0.0
+                # Sigmoid-like function centered at ratio = 0.85
+                logistic = 1.0 / (1.0 + math.exp(-alpha * (ratio - center)))
+                
+                # Scale this logistic value between min_dropout_rate and max_dropout_rate
+                dropout = (
+                    self.min_dropout_rate +
+                    (self.max_dropout_rate - self.min_dropout_rate) * logistic
+                )
+                
+                # Clamp in [0, 1] just in case
+                dropout = max(0.0, min(1.0, dropout))
+                self.dropout_prob[trigger][tag] = dropout
 
-            # Sigmoid-like function centered at ratio = 0.85
-            logistic = 1.0 / (1.0 + math.exp(-alpha * (ratio - center)))
-            
-            # Scale this logistic value between min_dropout_rate and max_dropout_rate
-            dropout = (
-                self.min_dropout_rate +
-                (self.max_dropout_rate - self.min_dropout_rate) * logistic
-            )
-            
-            # Clamp in [0, 1] just in case
-            dropout = max(0.0, min(1.0, dropout))
-            self.dropout_prob[tag] = dropout
-
-    def process_caption_adaptive_dropout(self, caption: str, shuffle: bool = False) -> str:
+    def process_caption_adaptive_dropout(self, caption: str, shuffle: bool = False) -> Union[str, bool]:
         """
         Based on self.dropout_prob, randomly drops tags from the caption.
         The subset object presumably can tell us which directory or category
         it belongs to, so we know which directory's dropout probabilities to use.
         """
+        matching_trigger = [trigger for trigger in self.trigger_token if trigger in caption]
+        if not matching_trigger:
+            # No trigger token in the caption, we cannot drop any tags
+            return False
         tags = caption.split(",")
         new_tags = []
 
         for tag in tags:
             original_tag = tag.strip().lower()
             # skip trigger token
-            if self.trigger_token and self.trigger_token in original_tag: # no dropout for trigger token
+            if self.trigger_token and any(t in original_tag for t in matching_trigger):
                 new_tags.append(original_tag)
                 continue
 
             # Lookup dropout probability
-            drop_prob = self.dropout_prob.get(original_tag, 0.0)
+            drop_prob = max([self.dropout_prob[t].get(original_tag, 0.0) for t in matching_trigger])
             # Decide whether to keep this tag
             if random.random() > drop_prob:
                 if any(t in original_tag for t in no_dropout_tokens):
                     # if any of the no_dropout_tokens are in the tag, keep it
                     new_tags.append(original_tag)
-                    log_every(f"Kept tag: {original_tag} (prob={drop_prob})", 100)
+                    log_every(f"Kept tag: {original_tag} (prob={drop_prob}), matching trigger: {matching_trigger}", 100)
                     continue
                 new_tags.append(original_tag)
             else:
@@ -811,7 +877,7 @@ class BaseSubset:
                     info_file = self.metadata_file
                 else:
                     info_file = self.image_dir
-                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}", 100)
+                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {matching_trigger}", 100)
                 # tag is dropped
                 pass
         if shuffle:
