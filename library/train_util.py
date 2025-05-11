@@ -1198,7 +1198,10 @@ class BaseDataset(torch.utils.data.Dataset):
         if subset.caption_suffix:
             caption = caption + " " + subset.caption_suffix
         if subset.adaptive_dropout:
-            return subset.process_caption_adaptive_dropout(caption, shuffle=subset.shuffle_caption)
+            result = subset.process_caption_adaptive_dropout(caption, shuffle=subset.shuffle_caption)
+            if result:
+                # caption is dropped
+                return result
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
