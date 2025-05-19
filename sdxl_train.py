@@ -39,9 +39,13 @@ from library.custom_train_functions import (
     apply_snr_weight,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
+    regularize_first_step_prediction,
+    fix_noise_scheduler_betas_for_zero_terminal_snr,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    fourier_highfreq_loss,
+    apply_snr_weighted_loss,
 )
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
@@ -122,7 +126,12 @@ def train(args):
     use_dreambooth_method = args.in_json is None
 
     tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
-
+    # acceleratorを準備する
+    logger.info("prepare accelerator")
+    accelerator = train_util.prepare_accelerator(args)
+    logger.info(f"Accelerator prepared at {accelerator.device} / process index : {accelerator.num_processes}, local process index : {accelerator.local_process_index}")
+    logger.info(f"Waiting for everyone / 他のプロセスを待機中")
+    accelerator.wait_for_everyone()
     # データセットを準備する
     if args.dataset_class is None:
         blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
@@ -194,12 +203,6 @@ def train(args):
             train_dataset_group.is_text_encoder_output_cacheable()
         ), "when caching text encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / text encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
 
-    # acceleratorを準備する
-    logger.info("prepare accelerator")
-    accelerator = train_util.prepare_accelerator(args)
-    logger.info(f"Accelerator prepared at {accelerator.device} / process index : {accelerator.num_processes}, local process index : {accelerator.local_process_index}")
-    logger.info(f"Waiting for everyone / 他のプロセスを待機中")
-    accelerator.wait_for_everyone()
     logger.info("All processes are ready / すべてのプロセスが準備完了")
     if args.seed is not None:
         set_seed(args.seed + accelerator.local_process_index)
@@ -484,6 +487,7 @@ def train(args):
     )
     if args.zero_terminal_snr:
         custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler_orig, args.terminal_snr_value)
+        #custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr_angular(noise_scheduler_orig)
     prepare_scheduler_for_custom_training(noise_scheduler_orig, accelerator.device)
     prepare_scheduler_for_custom_training(noise_scheduler_non_ztsnr, accelerator.device)
 
@@ -614,13 +618,15 @@ def train(args):
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     loss = train_util.conditional_loss(noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c)
-                    if args.fourier_loss_weight > 0:
-                        freq_loss = fourier_highfreq_loss(noise_pred.float(), target.float(), reduction="mean")
-                        loss = loss + args.fourier_loss_weight * freq_loss
+
                     if args.masked_loss:
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
-
+                    if args.fourier_loss_weight > 0:
+                        freq_loss = fourier_highfreq_loss(noise_pred.float(), target.float(), reduction="none")
+                        loss = loss + args.fourier_loss_weight * freq_loss
+                    else:
+                        freq_loss = None
                     if args.min_snr_gamma:
                         loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
                     if args.scale_v_pred_loss_like_noise_pred:
@@ -629,7 +635,18 @@ def train(args):
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
-
+                    if args.first_step_reg:
+                        #  x_t  ==  noisy_latents fed to the UNet earlier in the step
+                        penalty = regularize_first_step_prediction(
+                            x_t           = noisy_latents,                 # pure‑noise latent at t
+                            model_pred    = noise_pred,                    # v‑ or ε‑prediction
+                            timesteps     = timesteps,                     # same tensor used in weighting
+                            noise_scheduler = noise_scheduler,
+                            threshold        = args.reg_threshold,
+                            penalty_strength = args.reg_penalty_strength,
+                            v_prediction     = args.v_parameterization
+                        )
+                        loss = loss + penalty
                     loss = loss.mean()  # mean over batch dimension
                 else:
                     loss = train_util.conditional_loss(noise_pred.float(), target.float(), reduction="mean", loss_type=args.loss_type, huber_c=huber_c)
@@ -693,7 +710,10 @@ def train(args):
                     train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=train_unet)
                 else:
                     append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
-
+                if args.fourier_loss_weight > 0:
+                    logs["fourier_loss"] = freq_loss.mean().item()
+                if args.first_step_reg:
+                    logs["first_step_reg_loss"] = penalty.mean().item()
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
