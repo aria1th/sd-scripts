@@ -114,6 +114,12 @@ LAST_STATE_NAME = "{}-state"
 DEFAULT_EPOCH_NAME = "epoch"
 DEFAULT_LAST_OUTPUT_NAME = "last"
 
+LOSS_WEIGHTS_CONDITIONS = {}
+if os.path.exists('loss_weights.json'):
+    with open('loss_weights.json', 'r') as f:
+        LOSS_WEIGHTS_CONDITIONS = json.load(f) # {tag: weight, ...}
+
+
 DEFAULT_STEP_NAME = "at"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
@@ -324,6 +330,8 @@ def _worker_auto(captions_chunk, valid_triggers):
         tags = [t.strip().lower() for t in caption.split(",") if t.strip()]
         triggers = ["character:"+ m.group(1).strip() for m in CHAR_RE.finditer(caption)]
         for trig in triggers:
+            if not trig.strip():
+                continue
             if trig not in valid_triggers:
                 continue
             local_caption_per_tag[trig] += 1
@@ -408,6 +416,7 @@ class ImageInfo:
         self.text_encoder_pool2: Optional[torch.Tensor] = None
         self.supports_multiple_caption: bool = False
         self.subset_idx: int = subset_idx
+        self.loss_weight: Optional[float] = None
 
     def get_caption(self, random_instance=None):
         """
@@ -419,6 +428,21 @@ class ImageInfo:
             return random_instance.choice(self.captions)
         else:
             return self.caption
+    
+    def get_loss_weight(self):
+        if self.loss_weight is not None:
+            return self.loss_weight
+        caption = self.get_caption()
+        matching_weights = [
+            weight for key, weight in LOSS_WEIGHTS_CONDITIONS.items() if key in caption.replace(" ", "_")
+        ]
+        if matching_weights:
+            self.loss_weight = max(matching_weights)
+            log_every(f"Using loss weight {self.loss_weight} for caption: {caption}, {self.image_key}", 300)
+            return self.loss_weight
+        else:
+            self.loss_weight = 1.0
+            return 1.0
 
 class MultiCaptionImageInfo(ImageInfo):
     """
@@ -464,6 +488,7 @@ def decrypt_json_file(encrypted_file, password):
 SKIP_PATH_CHECK = False
 
 def dropout_copyright_or_year(tokens):
+    assert isinstance(tokens, list), "tokens should be a list"
     selected = []
     for token in tokens:
         if "copyright" in token or "year" in token or "series" in token:
@@ -528,10 +553,9 @@ def dropout_coocurrence(tokens):
             continue
         if random.random() > prob:
             selected.append(token)
-    selected = dropout_copyright_or_year(selected)
     selected = set(selected) # remove duplicates
     selected = list(selected)
-    log_every(f"CHAR_COOCCURRENCE_DROPOUT: {selected}, char_tags : {char_tags}", 25)
+    log_every(f"CHAR_COOCCURRENCE_DROPOUT: {selected}, char_tags : {char_tags}", 100)
     return selected
 def set_skip_path_check(skip):
     global SKIP_PATH_CHECK
@@ -563,7 +587,16 @@ class BucketManager:
     def add_image(self, reso, image_or_info):
         bucket_id = self.reso_to_id[reso]
         self.buckets[bucket_id].append(image_or_info)
+    
+    def drop_buckets_if_less(self, count=0):
+        for i in range(len(self.buckets) - 1, -1, -1):
+            if len(self.buckets[i]) <= count:
+                print(f"Dropping bucket {i} with resolution {self.resos[i]} due to insufficient images.")
+                del self.buckets[i]
+                del self.reso_to_id[self.resos[i]]
+                del self.resos[i]
 
+    
     def shuffle(self):
         for bucket in self.buckets:
             random.shuffle(bucket)
@@ -979,7 +1012,7 @@ class BaseSubset:
                     info_file = self.metadata_file
                 else:
                     info_file = self.image_dir
-                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {matching_trigger}", 1000)
+                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {matching_trigger}", 6000)
                 # tag is dropped
                 pass
         if shuffle:
@@ -1397,7 +1430,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         if random.random() < 0.05:
                             l.append("extremely simple caption")
                         return tokens
-                    if random.random() < 0.30:
+                    if random.random() < 0.20:
                         target_tokens = max(10, int(len_tokens * 0.3))
                         selected_token_indices = random.sample(range(len_tokens), min(target_tokens, len_tokens))
                         for i, token in enumerate(tokens):
@@ -1406,7 +1439,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         if len(l) <= 50 and sum(len(x) for x in l) < 25:
                             if random.random() < 0.05:
                                 l.append("very simple caption")
-                    elif random.random() < 0.30:
+                    elif random.random() < 0.10:
                         target_tokens = max(15, int(len_tokens * 0.4))
                         selected_token_indices = random.sample(range(len_tokens), min(target_tokens, len_tokens))
                         for i, token in enumerate(tokens):
@@ -1415,7 +1448,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         if len(l) <= 50 and sum(len(x) for x in l) < 25:
                             if random.random() < 0.05:
                                 l.append("simple caption")
-                    elif random.random() < 0.20:
+                    elif random.random() < 0.10:
                         # use only max 6 tokens
                         target_tokens = min(6, len_tokens)
                         selected_token_indices = random.sample(range(len_tokens), target_tokens)
@@ -1493,7 +1526,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     caption = caption.replace(str_from, str_to)
         if not is_drop_out and subset.caption_tag_dropout_rate == 0 and subset.token_warmup_step == 0:
             assert caption, "caption should not be empty if not dropout, warmup, or tag dropout"
-        log_every(f"caption: {caption}, {subset.shuffle_caption}", 3000)
+        log_every(f"caption: {caption}, {subset.shuffle_caption}", 300)
         return caption
 
     def get_input_ids(self, caption, tokenizer=None):
@@ -1605,6 +1638,7 @@ class BaseDataset(torch.utils.data.Dataset):
         # bucket情報を表示、格納する
         if self.enable_bucket:
             self.bucket_info = {"buckets": {}}
+            self.bucket_manager.drop_buckets_if_less(32)
             logger.info("number of images (including repeats) / 各bucketの画像枚数（繰り返し回数を含む）")
             for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
                 count = len(bucket)
@@ -1886,9 +1920,10 @@ class BaseDataset(torch.utils.data.Dataset):
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
-            loss_weights.append(
-                self.prior_loss_weight if image_info.is_reg else 1.0
-            )  # in case of fine tuning, is_reg is always False
+            if image_info.is_reg:
+                loss_weights.append(self.prior_loss_weight)
+            else:
+                loss_weights.append(image_info.get_loss_weight())
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
@@ -2472,12 +2507,11 @@ class FineTuningDataset(BaseDataset):
                 else:
                     # use as is
                     if tags is not None and len(tags) > 0:
-                        caption = caption + subset.caption_separator + tags
+                        caption = tags
                         tags_list.append(tags)
 
                 if caption is None:
                     caption = ""
-
                 image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset_idx)
                 image_info.image_size = img_md.get("train_resolution")
 
@@ -5089,7 +5123,6 @@ def prepare_accelerator(args: argparse.Namespace):
     )
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -5140,7 +5173,6 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", une
                 f"model is not found as a file or in Hugging Face, perhaps file name is wrong? / 指定したモデル名のファイル、またはHugging Faceのモデルが見つかりません。ファイル名が誤っているかもしれません: {name_or_path}"
             )
             raise ex
-        text_encoder = pipe.text_encoder
         vae = pipe.vae
         unet = pipe.unet
         del pipe
