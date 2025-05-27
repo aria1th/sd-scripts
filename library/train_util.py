@@ -78,6 +78,7 @@ import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging
+from accelerate.utils import TorchDynamoPlugin
 
 setup_logging()
 import logging
@@ -115,8 +116,8 @@ DEFAULT_EPOCH_NAME = "epoch"
 DEFAULT_LAST_OUTPUT_NAME = "last"
 
 LOSS_WEIGHTS_CONDITIONS = {}
-if os.path.exists('loss_weights.json'):
-    with open('loss_weights.json', 'r') as f:
+if os.path.exists('loss_weight.json'):
+    with open('loss_weight.json', 'r') as f:
         LOSS_WEIGHTS_CONDITIONS = json.load(f) # {tag: weight, ...}
 
 
@@ -181,11 +182,11 @@ CONVERTABLE_DICT = {
     "questionable" : ["nsfw", "with partial nudity", "questionable", "questionable content"],
     "explicit" : ["explicit", "nsfw", "with nudity", "adult content", "explicit material"],
 }
-COOCC_PATH=""
+COOCC_PATH="character_cooccurrence_sigmoid.json"
 with open(COOCC_PATH, 'r', encoding='utf-8') as f:
     CHAR_COOCCURRENCE_DROPOUT = json.load(f)
 
-popular_chars_names = ["momiji", "character", "futo", "inaba", "yor", "seija", "stout", "sakuya", "yazawa", "tamamo", "ellen", "d'arc", "murasa", "misaka", "hearn", "kisaragi", "kaku", "ichinose", "hatate", "suwako", "douji", "aqua", "yoko", "samidare", "kikuchi", "nilou", "yuyuko", "sekibanki", "asashio", "rumia", "megurine", "kotori", "formidable", "frieren", "satori", "shijou", "kyrielight", "kanako", "remilia", "koakuma", "gardevoir", "littner", "princess", "d.va", "saber", "higuchi", "koishi", "bridget", "minami", "inkling", "monster", "kokomi", "miho", "kasodani", "houraisan", "kongou", "artoria", "chen", "pyra", "patchouli", "konpaku", "tojo", "mercury", "shinobu", "tewi", "suika", "izumi", "shiroko", "inazuma", "kurodani", "akemi", "fujiwara", "mononobe", "kokoro", "nagae", "azusa", "youmu", "oma", "kafka", "c.c.", "arisu", "abigail", "mae", "yumemi", "manhattan", "mona", "shirakami", "zhongli", "shibuya", "kawashiro", "kaenbyou", "zero", "nakano", "yuudachi", "tao", "eula", "hoshimachi", "kasen", "raiden", "yuugi", "takane", "murakumo", "hoshii", "watanabe", "rio", "minamoto", "kaname", "minato", "pendragon", "williams", "udongein", "shower", "super", "ryuuko", "himekaidou", "mirko", "cammy", "sayaka", "riamu", "reimu", "yasaka", "komeiji", "nightbug", "tachyon", "kokichi", "lumine", "utsuho", "rem", "tatsumaki", "shimamura", "sonoda", "takagaki", "shenhe", "kagerou", "miki", "houjuu", "lillie", "nagato", "senketsu", "amami", "player", "byakuren", "junko", "asuna", "kashima", "komachi", "kinomoto", "power", "kagamine", "kirisame", "kogasa", "sanae", "souji", "nico", "seiga", "mokou", "aran", "iono", "usami", "nazrin", "akiyama", "kamisato", "joe", "miku", "nozomi", "shooter", "nahida", "luka", "mythra", "claudius", "kyoko", "yagokoro", "iku", "aya", "kaede", "takina", "morrigan", "amiya", "gokou", "yoshika", "suzuya", "dawn", "kamishirasawa", "shuten", "okita", "joseph", "reisalin", "ruri", "haruka", "nitori", "marnie", "plana", "renko", "shameimaru", "samus", "makoto", "holo", "doll", "yuuka", "hinanawi", "hatsune", "shiranui", "daiyousei", "kanzaki", "magician", "rembran", "reiuji", "jougasaki", "tohsaka", "maki", "ibuki", "karin", "kai", "oshino", "koharu", "bowsette", "eiki", "toki", "ayaka", "cafe", "sagiri", "yelan", "zeppeli", "zelda", "wriggle", "hata", "ganaha", "saigyouji", "shimakaze", "mayuzumi", "shogun", "lorelei", "einzbern", "fuyuko", "knowledge", "sonico", "tifa", "rensouhou-chan", "rin", "kyouko", "kaguya", "serval", "nino", "ranko", "madoka", "flandre", "kisaki", "hong", "illyasviel", "koume", "hamakaze", "chun-li", "miko", "oyama", "shanghai", "joestar", "uzuki", "umi", "yui", "kaga", "tomoe", "mika", "mash", "ganyu", "ibaraki", "fubuki", "miorine", "ayanami", "arona", "2b", "boo", "eirin", "kazusa", "mio", "aensland", "anthonio", "von", "meiling", "parsee", "tachibana", "warrior", "kitagawa", "fumika", "marine", "yamame", "alter", "marisa", "rikka", "megumin", "moriya", "sparkle", "nishizumi", "matoi", "takao", "raikou", "briar", "minamitsu", "rei", "imaizumi", "asuka", "kazami", "hk416", "shiki", "nero", "keine", "amatsukaze", "karyl", "hina", "chino", "mari", "nanami", "izayoi", "yae", "onozuka", "nishikigi", "nishikino", "yamato", "makima", "suigintou", "sagisawa","mizuhashi", "yotsuba", "chiaki", "margatroid", "ushio", "mikoto", "ayase", "mai", "hitori", "venti", "agnes", "scathach", "yoimiya", "gawr", "sagume", "ooyodo", "reisen", "chihaya", "haruhi", "gumi", "akagi", "souryuu", "hirasawa", "homura", "shigure", "hibiki", "yuzuki", "acheron", "link", "sakura", "ryuujou", "atago", "inubashiri", "mami", "nue", "yukari", "eugen", "jeanne", "gura", "firefly", "hestia", "anchovy", "haruna", "aru", "houshou", "gotoh", "akatsuki", "kishin", "alice", "kijin", "hijiri", "kagiyama", "yakumo", "suisei", "ro-500", "keqing", "testarossa", "scarlet", "iowa", "suletta", "tenshi", "langley", "lockhart", "tatara", "mystia", "adachi", "rosa", "hoshiguma", "yuki", "hakurei", "furina", "daiwa", "mahiro", "aris", "suzumiya", "kochiya", "inoue", "fate", "nami", "hunter", "tenryuu", "shirasaka", "astolfo", "caesar", "prinz", "marin", "toyosatomimi", "kafuu", "takarada", "hoshino", "clownpiece", "cynthia", "miyako", "darjeeling", "sangonomiya", "chisato", "rice", "ikazuchi", "cirno", "maribel", "mizumiya", "niko", "kikirara", "riona"]
+popular_chars_names = ["momiji", "character", "futo", "inaba", "yor", "seija", "stout", "sakuya", "yazawa", "tamamo", "ellen", "d'arc", "murasa", "misaka", "hearn", "kisaragi", "kaku", "ichinose", "hatate", "suwako", "douji", "aqua", "yoko", "samidare", "kikuchi", "nilou", "yuyuko", "sekibanki", "asashio", "rumia", "megurine", "kotori", "formidable", "frieren", "satori", "shijou", "kyrielight", "kanako", "remilia", "koakuma", "gardevoir", "littner", "princess", "d.va", "saber", "higuchi", "koishi", "bridget", "minami", "inkling", "monster", "kokomi", "miho", "kasodani", "houraisan", "kongou", "artoria", "chen", "pyra", "patchouli", "konpaku", "tojo", "mercury", "shinobu", "tewi", "suika", "izumi", "shiroko", "inazuma", "kurodani", "akemi", "fujiwara", "mononobe", "kokoro", "nagae", "azusa", "youmu", "kafka", "c.c.", "arisu", "abigail", "yumemi", "manhattan", "mona", "shirakami", "zhongli", "shibuya", "kawashiro", "kaenbyou", "zero", "nakano", "yuudachi", "tao", "eula", "hoshimachi", "kasen", "raiden", "yuugi", "takane", "murakumo", "hoshii", "watanabe", "rio", "minamoto", "kaname", "minato", "pendragon", "williams", "udongein", "shower", "super", "ryuuko", "himekaidou", "mirko", "cammy", "sayaka", "riamu", "reimu", "yasaka", "komeiji", "nightbug", "tachyon", "kokichi", "lumine", "utsuho", "rem", "tatsumaki", "shimamura", "sonoda", "takagaki", "shenhe", "kagerou", "miki", "houjuu", "lillie", "nagato", "senketsu", "amami", "player", "byakuren", "junko", "asuna", "kashima", "komachi", "kinomoto", "power", "kagamine", "kirisame", "kogasa", "sanae", "souji", "nico", "seiga", "mokou", "aran", "iono", "usami", "nazrin", "akiyama", "kamisato", "joe", "miku", "nozomi", "shooter", "nahida", "luka", "mythra", "claudius", "kyoko", "yagokoro", "iku", "aya", "kaede", "takina", "morrigan", "amiya", "gokou", "yoshika", "suzuya", "dawn", "kamishirasawa", "shuten", "okita", "joseph", "reisalin", "ruri", "haruka", "nitori", "marnie", "plana", "renko", "shameimaru", "samus", "makoto", "holo", "doll", "yuuka", "hinanawi", "hatsune", "shiranui", "daiyousei", "kanzaki", "magician", "rembran", "reiuji", "jougasaki", "tohsaka", "maki", "ibuki", "karin", "kai", "oshino", "koharu", "bowsette", "eiki", "toki", "ayaka", "sagiri", "yelan", "zeppeli", "zelda", "wriggle", "hata", "ganaha", "saigyouji", "shimakaze", "mayuzumi", "shogun", "lorelei", "einzbern", "fuyuko", "knowledge", "sonico", "tifa", "rensouhou-chan", "rin", "kyouko", "kaguya", "serval", "nino", "ranko", "madoka", "flandre", "kisaki", "hong", "illyasviel", "koume", "hamakaze", "chun-li", "miko", "oyama", "shanghai", "joestar", "uzuki", "umi", "yui", "kaga", "tomoe", "mika", "mash", "ganyu", "ibaraki", "fubuki", "miorine", "ayanami", "arona", "2b", "boo", "eirin", "kazusa", "mio", "aensland", "anthonio", "von", "meiling", "parsee", "tachibana", "warrior", "kitagawa", "fumika", "marine", "yamame", "alter", "marisa", "rikka", "megumin", "moriya", "sparkle", "nishizumi", "matoi", "takao", "raikou", "briar", "minamitsu", "rei", "imaizumi", "asuka", "kazami", "hk416", "shiki", "nero", "keine", "amatsukaze", "karyl", "hina", "chino", "mari", "nanami", "izayoi", "yae", "onozuka", "nishikigi", "nishikino", "yamato", "makima", "suigintou", "sagisawa","mizuhashi", "yotsuba", "chiaki", "margatroid", "ushio", "mikoto", "ayase", "mai", "hitori", "venti", "agnes", "scathach", "yoimiya", "gawr", "sagume", "ooyodo", "reisen", "chihaya", "haruhi", "gumi", "akagi", "souryuu", "hirasawa", "homura", "shigure", "hibiki", "yuzuki", "acheron", "link", "sakura", "ryuujou", "atago", "inubashiri", "mami", "nue", "yukari", "eugen", "jeanne", "gura", "firefly", "hestia", "anchovy", "haruna", "aru", "houshou", "gotoh", "akatsuki", "kishin", "alice", "kijin", "hijiri", "kagiyama", "yakumo", "suisei", "ro-500", "keqing", "testarossa", "scarlet", "iowa", "suletta", "tenshi", "langley", "lockhart", "tatara", "mystia", "adachi", "rosa", "hoshiguma", "yuki", "hakurei", "furina", "daiwa", "mahiro", "aris", "suzumiya", "kochiya", "inoue", "fate", "nami", "hunter", "tenryuu", "shirasaka", "astolfo", "caesar", "prinz", "marin", "toyosatomimi", "kafuu", "takarada", "hoshino", "clownpiece", "cynthia", "miyako", "darjeeling", "sangonomiya", "chisato", "rice", "ikazuchi", "cirno", "maribel", "mizumiya", "niko", "kikirara", "riona"]
 no_dropout_tokens = [
     # "low ",
     "lineart",
@@ -292,6 +293,11 @@ no_dropout_tokens = [
     "koma",
     "photo",
     "real",
+    "focus",
+    "panties",
+    "underwear",
+    "bulge",
+    "pectoral",
     "ai-generated" # mark the image is generated by AI
 ] + [
     "pus"+ "sy",
@@ -328,7 +334,8 @@ def _worker_auto(captions_chunk, valid_triggers):
 
     for caption in captions_chunk:
         tags = [t.strip().lower() for t in caption.split(",") if t.strip()]
-        triggers = ["character:"+ m.group(1).strip() for m in CHAR_RE.finditer(caption)]
+        triggers = [m.group(1).strip() for m in CHAR_RE.finditer(caption)]
+        triggers = ["character:"+ t for t in triggers if t]
         for trig in triggers:
             if not trig.strip():
                 continue
@@ -429,19 +436,15 @@ class ImageInfo:
         else:
             return self.caption
     
-    def get_loss_weight(self):
-        if self.loss_weight is not None:
-            return self.loss_weight
-        caption = self.get_caption()
+    def get_loss_weight(self, caption: Optional[str] = None):
+        caption = caption or self.get_caption()
         matching_weights = [
             weight for key, weight in LOSS_WEIGHTS_CONDITIONS.items() if key in caption.replace(" ", "_")
         ]
         if matching_weights:
-            self.loss_weight = max(matching_weights)
-            log_every(f"Using loss weight {self.loss_weight} for caption: {caption}, {self.image_key}", 300)
-            return self.loss_weight
+            log_every(f"Using loss weight {max(matching_weights)} for caption: {caption}, {self.image_key}", 200)
+            return max(matching_weights)
         else:
-            self.loss_weight = 1.0
             return 1.0
 
 class MultiCaptionImageInfo(ImageInfo):
@@ -519,7 +522,7 @@ def dropout_coocurrence(tokens):
     # if character: prefix exists, collect
     for i, token in enumerate(tokens_underbar):
         if "character:" in token:
-            char_name = token.split("character:")[1]
+            char_name = token.split("character:")[1].strip()
             if char_name not in character_prefix_map:
                 character_prefix_map[char_name] = token
             tokens_underbar[i] = char_name # remove character: prefix
@@ -821,6 +824,9 @@ class BaseSubset:
         self.min_dropout_rate = min_adaptive_dropout
         self.max_dropout_rate = max_adaptive_dropout
         self.trigger_token = [a.strip() for a in adaptive_dropout_trigger_token.split(",")] if adaptive_dropout_trigger_token else None
+        if self.trigger_token is not None:
+            # remove empty strings from trigger_token
+            self.trigger_token = [t for t in self.trigger_token if t.strip()]  # remove empty strings
         self.adaptive_dropout = adaptive_dropout
 
     def set_tag_frequency(self, captions):
@@ -839,10 +845,10 @@ class BaseSubset:
                 for caption in captions:
                     for tag in caption.split(","):
                         tag = tag.strip()
-                        if tag.startswith("character:"):
+                        if tag.startswith("character:") and tag.split(":", 1)[1].strip():
                             self.trigger_token[tag] = self.trigger_token.get(tag, 0) + 1
                 # Filter out tokens with occurrence < 500
-                self.trigger_token = [k for k, v in self.trigger_token.items() if v <= 500 and v >= 5]
+                self.trigger_token = [k for k, v in self.trigger_token.items() if v <= 500 and v >= 5 and k.strip()]
                 logger.info(f"Found trigger tokens: {len(self.trigger_token)}")
                 is_automatic = True
         trigger_to_caption = defaultdict(list)
@@ -976,49 +982,51 @@ class BaseSubset:
                     dropout = max(0.0, min(1.0, dropout))
                     self.dropout_prob[trigger][tag] = dropout
 
-    def process_caption_adaptive_dropout(self, caption: str, shuffle: bool = False) -> Union[str, bool]:
+    def process_caption_adaptive_dropout(self, caption: str, shuffle: bool = False) -> Tuple[Union[str, bool], List[str]]:
         """
         Based on self.dropout_prob, randomly drops tags from the caption.
         The subset object presumably can tell us which directory or category
         it belongs to, so we know which directory's dropout probabilities to use.
         """
-        matching_trigger = [trigger for trigger in self.trigger_token if trigger in caption]
+        matching_trigger = [trigger for trigger in self.trigger_token if trigger.strip in caption]
         if not matching_trigger:
             # No trigger token in the caption, we cannot drop any tags
             return False
         tags = caption.split(",")
         new_tags = []
+        triggers_in_caption = []
 
         for tag in tags:
             original_tag = tag.strip().lower()
             # skip trigger token
             if self.trigger_token and any(t in original_tag for t in matching_trigger):
                 new_tags.append(original_tag)
+                triggers_in_caption.append(original_tag)
                 continue
 
             # Lookup dropout probability
             drop_prob = max([self.dropout_prob[t].get(original_tag, 0.0) for t in matching_trigger])
             # Decide whether to keep this tag
-            if random.random() > drop_prob:
+            if random.random() > drop_prob or "girl" in original_tag or "boy" in original_tag or "other" in original_tag:
                 new_tags.append(original_tag)
             else:
-                matched_no_dropout = [t for t in no_dropout_tokens_1 if t in original_tag]
+                matched_no_dropout = any(t for t in no_dropout_tokens_1 if t in original_tag) # faster
                 if matched_no_dropout:
                     # if any of the no_dropout_tokens are in the tag, keep it
                     new_tags.append(original_tag)
-                    #log_every(f"Kept tag: {original_tag} (prob={drop_prob}), prevented by: {matched_no_dropout}", 10000)
+                    log_every(f"Kept tag: {original_tag} (prob={drop_prob})", 6000)
                     continue
                 if isinstance(self, FineTuningSubset):
                     info_file = self.metadata_file
                 else:
                     info_file = self.image_dir
-                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {matching_trigger}", 6000)
+                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {triggers_in_caption}", 6000)
                 # tag is dropped
                 pass
         if shuffle:
             random.shuffle(new_tags)
         # Join them back into a comma-separated string
-        return ", ".join(new_tags)
+        return ", ".join(new_tags), triggers_in_caption
 
 class DreamBoothSubset(BaseSubset):
     def __init__(
@@ -1232,6 +1240,7 @@ def shuffle_caption_by_separtor(caption, separator, caption_splitter):
         return splitted_parts[0], []
     # flatten
     flex_part = [c for parts in splitted_parts[1:] for c in parts]
+    flex_part = [c for c in flex_part if c.strip()]  # remove empty strings
     return splitted_parts[0], flex_part
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -1333,9 +1342,11 @@ class BaseDataset(torch.utils.data.Dataset):
         if subset.caption_suffix:
             caption = caption + " " + subset.caption_suffix
         if subset.adaptive_dropout:
-            result = subset.process_caption_adaptive_dropout(caption, shuffle=subset.shuffle_caption)
+            result, triggers = subset.process_caption_adaptive_dropout(caption, shuffle=subset.shuffle_caption)
             if result:
                 caption = result
+        else:
+            triggers = []
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
@@ -1424,6 +1435,45 @@ class BaseDataset(torch.utils.data.Dataset):
                         "sensitive",
                         "nsfw",
                         "nudity",
+                        "pussy",
+                        "penis",
+                        "nipple",
+                        "pectoral",
+                        "anus",
+                        "cleft",
+                        "sex",
+                        "insertion",
+                        "intercourse",
+                        "vaginal",
+                        "anal",
+                        "fella",
+                        "futanari",
+                        "yaoi",
+                        "censor",
+                        "cameltoe",
+                        "panties",
+                        "underwear",
+                        "adult",
+                        "areola",
+                        "footjob",
+                        "text",
+                        "logo",
+                        "signature",
+                        "watermark",
+                        "digits",
+                        "anatomy",
+                        "bad",
+                        "buttjob",
+                        "cowgirl",
+                        "erection",
+                        "bulge",
+                        "fingering",
+                        "ejaculation",
+                        "name",
+                        "testicle",
+                        "paizuri",
+                        "covered"
+                        
                     ] # this must not be dropped
                     len_tokens = len(tokens)
                     if len_tokens < 10:
@@ -1498,9 +1548,12 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 #if subset.shuffle_caption:
                 #    random.shuffle(flex_tokens)
+                initial_flex_tokens = flex_tokens[:] # copy
                 flex_tokens = dropout_coocurrence(flex_tokens)
                 flex_tokens = dropout_tags(flex_tokens)
                 flex_tokens = dropout_copyright_or_year(flex_tokens)
+                flex_tokens = set(flex_tokens) + set(triggers)
+                flex_tokens = list(flex_tokens)
                 fixed_tokens, flex_tokens = convert_tags_if_needed(fixed_tokens), convert_tags_if_needed(flex_tokens)
                 # by random chance, use different join
                 if random.random() < 0.5:
@@ -1509,6 +1562,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     caption = " ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
                 else:
                     caption = ",".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+                log_every(f"Initial flex tokens: {initial_flex_tokens}, result: {caption}", 300)
 
             # process secondary separator
             if subset.secondary_separator:
@@ -1526,7 +1580,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     caption = caption.replace(str_from, str_to)
         if not is_drop_out and subset.caption_tag_dropout_rate == 0 and subset.token_warmup_step == 0:
             assert caption, "caption should not be empty if not dropout, warmup, or tag dropout"
-        log_every(f"caption: {caption}, {subset.shuffle_caption}", 300)
+        log_every(f"caption: {caption}, {subset.shuffle_caption}", 1500)
         return caption
 
     def get_input_ids(self, caption, tokenizer=None):
@@ -1920,11 +1974,6 @@ class BaseDataset(torch.utils.data.Dataset):
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
-            if image_info.is_reg:
-                loss_weights.append(self.prior_loss_weight)
-            else:
-                loss_weights.append(image_info.get_loss_weight())
-
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
             # image/latentsを処理する
@@ -2045,7 +2094,10 @@ class BaseDataset(torch.utils.data.Dataset):
                         else:
                             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                         input_ids2_list.append(token_caption2)
-
+            if image_info.is_reg:
+                loss_weights.append(self.prior_loss_weight)
+            else:
+                loss_weights.append(image_info.get_loss_weight(caption))
         example = {}
         example["loss_weights"] = torch.FloatTensor(loss_weights)
 
@@ -5123,6 +5175,7 @@ def prepare_accelerator(args: argparse.Namespace):
     )
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
+    print("Dynamo backend:", dynamo_backend)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
