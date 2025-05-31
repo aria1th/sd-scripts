@@ -116,8 +116,8 @@ DEFAULT_EPOCH_NAME = "epoch"
 DEFAULT_LAST_OUTPUT_NAME = "last"
 
 LOSS_WEIGHTS_CONDITIONS = {}
-if os.path.exists('loss_weight.json'):
-    with open('loss_weight.json', 'r') as f:
+if os.path.exists('loss_weights.json'):
+    with open('loss_weights.json', 'r') as f:
         LOSS_WEIGHTS_CONDITIONS = json.load(f) # {tag: weight, ...}
 
 
@@ -183,11 +183,14 @@ CONVERTABLE_DICT = {
     "explicit" : ["explicit", "nsfw", "with nudity", "adult content", "explicit material"],
 }
 COOCC_PATH="character_cooccurrence_sigmoid.json"
-with open(COOCC_PATH, 'r', encoding='utf-8') as f:
-    CHAR_COOCCURRENCE_DROPOUT = json.load(f)
+if not os.path.exists(COOCC_PATH):
+    CHAR_COOCCURRENCE_DROPOUT = {}
+else:
+    with open(COOCC_PATH, 'r', encoding='utf-8') as f:
+        CHAR_COOCCURRENCE_DROPOUT = json.load(f)
 
 popular_chars_names = ["momiji", "character", "futo", "inaba", "yor", "seija", "stout", "sakuya", "yazawa", "tamamo", "ellen", "d'arc", "murasa", "misaka", "hearn", "kisaragi", "kaku", "ichinose", "hatate", "suwako", "douji", "aqua", "yoko", "samidare", "kikuchi", "nilou", "yuyuko", "sekibanki", "asashio", "rumia", "megurine", "kotori", "formidable", "frieren", "satori", "shijou", "kyrielight", "kanako", "remilia", "koakuma", "gardevoir", "littner", "princess", "d.va", "saber", "higuchi", "koishi", "bridget", "minami", "inkling", "monster", "kokomi", "miho", "kasodani", "houraisan", "kongou", "artoria", "chen", "pyra", "patchouli", "konpaku", "tojo", "mercury", "shinobu", "tewi", "suika", "izumi", "shiroko", "inazuma", "kurodani", "akemi", "fujiwara", "mononobe", "kokoro", "nagae", "azusa", "youmu", "kafka", "c.c.", "arisu", "abigail", "yumemi", "manhattan", "mona", "shirakami", "zhongli", "shibuya", "kawashiro", "kaenbyou", "zero", "nakano", "yuudachi", "tao", "eula", "hoshimachi", "kasen", "raiden", "yuugi", "takane", "murakumo", "hoshii", "watanabe", "rio", "minamoto", "kaname", "minato", "pendragon", "williams", "udongein", "shower", "super", "ryuuko", "himekaidou", "mirko", "cammy", "sayaka", "riamu", "reimu", "yasaka", "komeiji", "nightbug", "tachyon", "kokichi", "lumine", "utsuho", "rem", "tatsumaki", "shimamura", "sonoda", "takagaki", "shenhe", "kagerou", "miki", "houjuu", "lillie", "nagato", "senketsu", "amami", "player", "byakuren", "junko", "asuna", "kashima", "komachi", "kinomoto", "power", "kagamine", "kirisame", "kogasa", "sanae", "souji", "nico", "seiga", "mokou", "aran", "iono", "usami", "nazrin", "akiyama", "kamisato", "joe", "miku", "nozomi", "shooter", "nahida", "luka", "mythra", "claudius", "kyoko", "yagokoro", "iku", "aya", "kaede", "takina", "morrigan", "amiya", "gokou", "yoshika", "suzuya", "dawn", "kamishirasawa", "shuten", "okita", "joseph", "reisalin", "ruri", "haruka", "nitori", "marnie", "plana", "renko", "shameimaru", "samus", "makoto", "holo", "doll", "yuuka", "hinanawi", "hatsune", "shiranui", "daiyousei", "kanzaki", "magician", "rembran", "reiuji", "jougasaki", "tohsaka", "maki", "ibuki", "karin", "kai", "oshino", "koharu", "bowsette", "eiki", "toki", "ayaka", "sagiri", "yelan", "zeppeli", "zelda", "wriggle", "hata", "ganaha", "saigyouji", "shimakaze", "mayuzumi", "shogun", "lorelei", "einzbern", "fuyuko", "knowledge", "sonico", "tifa", "rensouhou-chan", "rin", "kyouko", "kaguya", "serval", "nino", "ranko", "madoka", "flandre", "kisaki", "hong", "illyasviel", "koume", "hamakaze", "chun-li", "miko", "oyama", "shanghai", "joestar", "uzuki", "umi", "yui", "kaga", "tomoe", "mika", "mash", "ganyu", "ibaraki", "fubuki", "miorine", "ayanami", "arona", "2b", "boo", "eirin", "kazusa", "mio", "aensland", "anthonio", "von", "meiling", "parsee", "tachibana", "warrior", "kitagawa", "fumika", "marine", "yamame", "alter", "marisa", "rikka", "megumin", "moriya", "sparkle", "nishizumi", "matoi", "takao", "raikou", "briar", "minamitsu", "rei", "imaizumi", "asuka", "kazami", "hk416", "shiki", "nero", "keine", "amatsukaze", "karyl", "hina", "chino", "mari", "nanami", "izayoi", "yae", "onozuka", "nishikigi", "nishikino", "yamato", "makima", "suigintou", "sagisawa","mizuhashi", "yotsuba", "chiaki", "margatroid", "ushio", "mikoto", "ayase", "mai", "hitori", "venti", "agnes", "scathach", "yoimiya", "gawr", "sagume", "ooyodo", "reisen", "chihaya", "haruhi", "gumi", "akagi", "souryuu", "hirasawa", "homura", "shigure", "hibiki", "yuzuki", "acheron", "link", "sakura", "ryuujou", "atago", "inubashiri", "mami", "nue", "yukari", "eugen", "jeanne", "gura", "firefly", "hestia", "anchovy", "haruna", "aru", "houshou", "gotoh", "akatsuki", "kishin", "alice", "kijin", "hijiri", "kagiyama", "yakumo", "suisei", "ro-500", "keqing", "testarossa", "scarlet", "iowa", "suletta", "tenshi", "langley", "lockhart", "tatara", "mystia", "adachi", "rosa", "hoshiguma", "yuki", "hakurei", "furina", "daiwa", "mahiro", "aris", "suzumiya", "kochiya", "inoue", "fate", "nami", "hunter", "tenryuu", "shirasaka", "astolfo", "caesar", "prinz", "marin", "toyosatomimi", "kafuu", "takarada", "hoshino", "clownpiece", "cynthia", "miyako", "darjeeling", "sangonomiya", "chisato", "rice", "ikazuchi", "cirno", "maribel", "mizumiya", "niko", "kikirara", "riona"]
-no_dropout_tokens = [
+strict_no_dropout_tokens_initial = [
     # "low ",
     "lineart",
     "sex",
@@ -260,10 +263,16 @@ no_dropout_tokens = [
     "crossdressing",
     "androgynous",
     "futa", 
+    "belly",
+    "pregnant",
+    "fat ",
     "2girl", # gender / persons are important
     "2boy",
     "3girl",
     "3boy",
+    "artist",
+    "character",
+    "style",
     "4girl",
     "4boy",
     "5girl",
@@ -281,6 +290,9 @@ no_dropout_tokens = [
     "panties",
     "pubic",
     "topless",
+    "scat",
+    "guro",
+    "(meme)",
 #    "background",
     "abstract",
     "monochrome", "single toned", "gradient with one color",
@@ -305,8 +317,8 @@ no_dropout_tokens = [
     "pen"+"is",
     "an" +"us" # sexual tokens should not be dropped and always checked
     ]# The tokens that contains this will not be dropped
-no_dropout_tokens_1 = set(no_dropout_tokens)
-no_dropout_tokens = set(no_dropout_tokens + popular_chars_names)
+no_dropout_tokens_1 = set(strict_no_dropout_tokens_initial)
+no_dropout_tokens = set(strict_no_dropout_tokens_initial + popular_chars_names)
 print(no_dropout_tokens)
 
 def convert_tags_if_needed(tags):
@@ -333,11 +345,12 @@ def _worker_auto(captions_chunk, valid_triggers):
     local_tag_frequency = defaultdict(Counter)
 
     for caption in captions_chunk:
-        tags = [t.strip().lower() for t in caption.split(",") if t.strip()]
+        tags = [t.replace("_", " ").strip().lower() for t in caption.split(",") if t.replace("_", " ").strip()]
         triggers = [m.group(1).strip() for m in CHAR_RE.finditer(caption)]
-        triggers = ["character:"+ t for t in triggers if t]
+        triggers = [t for t in triggers if t]
         for trig in triggers:
-            if not trig.strip():
+            trig = trig.replace("_", " ").strip().lower()
+            if not trig:
                 continue
             if trig not in valid_triggers:
                 continue
@@ -442,7 +455,7 @@ class ImageInfo:
             weight for key, weight in LOSS_WEIGHTS_CONDITIONS.items() if key in caption.replace(" ", "_")
         ]
         if matching_weights:
-            log_every(f"Using loss weight {max(matching_weights)} for caption: {caption}, {self.image_key}", 200)
+            log_every(f"Using loss weight {max(matching_weights)} for caption: {caption}, {self.image_key}", 601)
             return max(matching_weights)
         else:
             return 1.0
@@ -490,10 +503,21 @@ def decrypt_json_file(encrypted_file, password):
     return json_data
 SKIP_PATH_CHECK = False
 
-def dropout_copyright_or_year(tokens):
+def dropout_copyright_or_year(tokens, no_dropout_tokens_additional=None):
     assert isinstance(tokens, list), "tokens should be a list"
     selected = []
     for token in tokens:
+        if no_dropout_tokens_additional and any(t in token for t in no_dropout_tokens_additional):
+            if "character:" in token:
+                if random.random() > 0.7:
+                    token = token.replace("character:", "").strip()
+            if "artist:" in token:
+                if random.random() > 0.96:
+                    token = token.replace("artist:", "").strip()
+                    if random.random() > 0.5:
+                        token = token + " style"
+            selected.append(token)
+            continue
         if "copyright" in token or "year" in token or "series" in token:
             if random.random() > 0.1:
                 continue
@@ -504,21 +528,22 @@ def dropout_copyright_or_year(tokens):
             if random.random() > 0.01:
                 continue
         if "character:" in token:
-            if random.random() > 0.5:
-                token = token.replace("character:", "")
+            if random.random() > 0.7:
+                token = token.replace("character:", "").strip()
         if "artist:" in token:
-            if random.random() > 0.5:
-                token = token.replace("artist:", "")
+            if random.random() > 0.96:
+                token = token.replace("artist:", "").strip()
                 if random.random() > 0.5:
                     token = token + " style"
         selected.append(token)
+    #log_every(f"DROPOUT_Copyright_or_year: {tokens} -> {selected}", 100)
     return selected
 
-def dropout_coocurrence(tokens):
+def dropout_coocurrence(tokens, no_dropout_tokens_additional=None):
     assert isinstance(tokens, list), "tokens should be a list"
     #CHAR_COOCCURRENCE_DROPOUT
     tokens_underbar = [t.replace(" ", "_") for t in tokens]
-    character_prefix_map = {}
+    character_prefix_map = {} # map character -> real token 
     # if character: prefix exists, collect
     for i, token in enumerate(tokens_underbar):
         if "character:" in token:
@@ -543,6 +568,7 @@ def dropout_coocurrence(tokens):
         return tokens # no coocurrence
     # dropout
     selected = []
+    prevented_tokens, causes = [], []
     for token in tokens_underbar:
         if token in merged_dict:
             continue
@@ -551,14 +577,18 @@ def dropout_coocurrence(tokens):
         else:
             selected.append(token)
     for token, prob in merged_dict.items():
-        if any(t in token for t in no_dropout_tokens_1):
+        token_1_prevent_result = dropout_prevent(token, no_dropout_tokens_1, no_dropout_tokens_additional)
+        if token_1_prevent_result is not None:
             selected.append(token)
+            prevented_tokens.append(token)
+            causes.append(token_1_prevent_result)
             continue
         if random.random() > prob:
             selected.append(token)
     selected = set(selected) # remove duplicates
     selected = list(selected)
-    log_every(f"CHAR_COOCCURRENCE_DROPOUT: {selected}, char_tags : {char_tags}", 100)
+    dropped_tokens = set(tokens_underbar) - set(selected)
+    log_every(f"CHAR_COOCCURRENCE_DROPOUT: {dropped_tokens}, char_tags : {char_tags}, prevented_tokens: {prevented_tokens}, causes: {causes}", 501)
     return selected
 def set_skip_path_check(skip):
     global SKIP_PATH_CHECK
@@ -767,6 +797,19 @@ class AugHelper:
     def get_augmentor(self, use_color_aug: bool):  # -> Optional[Callable[[np.ndarray], Dict[str, np.ndarray]]]:
         return self.color_aug if use_color_aug else None
 
+def dropout_prevent(tag, prevent_1, prevent_2=None):
+    cause = None
+    if prevent_1:
+        for p in prevent_1:
+            if p in tag:
+                cause = p
+                break
+    if not cause and prevent_2:
+        for p in prevent_2:
+            if p in tag:
+                cause = p
+                break
+    return cause
 
 class BaseSubset:
     def __init__(
@@ -846,7 +889,8 @@ class BaseSubset:
                     for tag in caption.split(","):
                         tag = tag.strip()
                         if tag.startswith("character:") and tag.split(":", 1)[1].strip():
-                            self.trigger_token[tag] = self.trigger_token.get(tag, 0) + 1
+                            tag_char = tag.split("character:", 1)[1].replace("_", " ").strip().lower()
+                            self.trigger_token[tag_char] = self.trigger_token.get(tag_char, 0) + 1
                 # Filter out tokens with occurrence < 500
                 self.trigger_token = [k for k, v in self.trigger_token.items() if v <= 500 and v >= 5 and k.strip()]
                 logger.info(f"Found trigger tokens: {len(self.trigger_token)}")
@@ -883,10 +927,10 @@ class BaseSubset:
         Sequential replacement for the parallel_count function.
         """
         for caption in tqdm(captions, desc="Counting captions"):
-            tags = [t.strip().lower() for t in caption.split(",") if t.strip()]
-            triggers = [t for t in tags if any(trig in t for trig in self.trigger_token)]
+            tags = [t.replace("_", " ").strip().lower() for t in caption.split(",") if t.replace("_", " ").strip()]
+            triggers = [t.replace("_", " ").strip().lower() for t in tags if any(trig in t for trig in self.trigger_token)]
             for trig in triggers:
-                self.caption_per_tag[trig] +=   1
+                self.caption_per_tag[trig] += 1
                 self.tag_frequency[trig].update(tags)
     def parallel_count(self, captions, workers=None, chunk_size=10_000, is_automatic=False):
         """
@@ -938,6 +982,7 @@ class BaseSubset:
             if trigger not in self.caption_per_tag:
                 possible_entries = [t for t in self.caption_per_tag if trigger in t]
                 if not possible_entries:
+                    print(f"Trigger token {trigger} not found in caption_per_tag, possible entries: {self.caption_per_tag.keys()}")
                     raise RuntimeError(f"None of the trigger tokens {trigger} found in caption_per_tag")
                 total_captions = max([self.caption_per_tag.get(subtag, 0) for subtag in possible_entries])
                 if total_captions == 0:
@@ -988,44 +1033,54 @@ class BaseSubset:
         The subset object presumably can tell us which directory or category
         it belongs to, so we know which directory's dropout probabilities to use.
         """
-        matching_trigger = [trigger for trigger in self.trigger_token if trigger.strip in caption]
+        matching_trigger = [trigger for trigger in self.trigger_token if trigger.strip() and trigger.strip() in caption]
         if not matching_trigger:
             # No trigger token in the caption, we cannot drop any tags
-            return False
+            return False, []
         tags = caption.split(",")
         new_tags = []
         triggers_in_caption = []
+        prevented, causes = [], []
+        probs = []
 
         for tag in tags:
-            original_tag = tag.strip().lower()
+            original_tag = tag.replace("_", " ").strip().lower()
             # skip trigger token
             if self.trigger_token and any(t in original_tag for t in matching_trigger):
                 new_tags.append(original_tag)
                 triggers_in_caption.append(original_tag)
+                probs.append(-1.0)  # -1.0 means this tag is a trigger token, not dropped
                 continue
+
+
 
             # Lookup dropout probability
             drop_prob = max([self.dropout_prob[t].get(original_tag, 0.0) for t in matching_trigger])
+            probs.append(drop_prob)
             # Decide whether to keep this tag
             if random.random() > drop_prob or "girl" in original_tag or "boy" in original_tag or "other" in original_tag:
                 new_tags.append(original_tag)
             else:
-                matched_no_dropout = any(t for t in no_dropout_tokens_1 if t in original_tag) # faster
-                if matched_no_dropout:
+                cause = dropout_prevent(original_tag, no_dropout_tokens_1)
+                #matched_no_dropout = any(t for t in no_dropout_tokens_1 if t in original_tag) # faster
+                if cause:
                     # if any of the no_dropout_tokens are in the tag, keep it
                     new_tags.append(original_tag)
-                    log_every(f"Kept tag: {original_tag} (prob={drop_prob})", 6000)
+                    prevented.append(original_tag)
+                    causes.append(cause)
+                    log_every(f"Kept tag: {original_tag} (prob={drop_prob})", 2503)
                     continue
                 if isinstance(self, FineTuningSubset):
                     info_file = self.metadata_file
                 else:
                     info_file = self.image_dir
-                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {triggers_in_caption}", 6000)
+                log_every(f"Dropped tag: {original_tag} (prob={drop_prob}), {info_file}, matching trigger: {matching_trigger}", 2501)
                 # tag is dropped
                 pass
         if shuffle:
             random.shuffle(new_tags)
         # Join them back into a comma-separated string
+        log_every(f"Adaptive dropout processed caption: {caption} -> {new_tags}, prevented: {prevented}, causes: {causes}, probs: {probs}", 102)
         return ", ".join(new_tags), triggers_in_caption
 
 class DreamBoothSubset(BaseSubset):
@@ -1354,7 +1409,6 @@ class BaseDataset(torch.utils.data.Dataset):
             or subset.caption_dropout_every_n_epochs > 0
             and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
         )
-
         if is_drop_out:
             caption = ""
         else:
@@ -1419,7 +1473,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                def dropout_tags(tokens):
+                def dropout_tags(tokens, no_dropout_tokens_additional=None):
                     assert isinstance(tokens, list), f"tokens must be a list, but got {type(tokens)} with {tokens}"
                     # drop until token length gets smaller than 225 (hardcoded here)
                     if len(tokens) > 225:
@@ -1428,10 +1482,14 @@ class BaseDataset(torch.utils.data.Dataset):
                     if subset.caption_tag_dropout_rate <= 0 or not subset.shuffle_caption:
                         return tokens
                     l = []
+                    # remove duplicates 
+                    tokens = set(s.replace("_", " ") for s in tokens if s.strip())
+                    tokens = list(tokens)  # convert back to list
                     # We control tne 'unconditional' generation by captioning
                     strict_no_dropout_tokens = [
                         "explicit",
                         "questionable",
+                        "halo",
                         "sensitive",
                         "nsfw",
                         "nudity",
@@ -1475,12 +1533,16 @@ class BaseDataset(torch.utils.data.Dataset):
                         "covered"
                         
                     ] # this must not be dropped
+                    
+                    strict_no_dropout_tokens.extend(no_dropout_tokens_additional or [])
+                    # add strict_no_dropout_tokens_initial
+                    strict_no_dropout_tokens.extend(strict_no_dropout_tokens_initial)
                     len_tokens = len(tokens)
                     if len_tokens < 10:
                         if random.random() < 0.05:
                             l.append("extremely simple caption")
                         return tokens
-                    if random.random() < 0.20:
+                    if random.random() < 0.30:
                         target_tokens = max(10, int(len_tokens * 0.3))
                         selected_token_indices = random.sample(range(len_tokens), min(target_tokens, len_tokens))
                         for i, token in enumerate(tokens):
@@ -1489,7 +1551,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         if len(l) <= 50 and sum(len(x) for x in l) < 25:
                             if random.random() < 0.05:
                                 l.append("very simple caption")
-                    elif random.random() < 0.10:
+                    elif random.random() < 0.30:
                         target_tokens = max(15, int(len_tokens * 0.4))
                         selected_token_indices = random.sample(range(len_tokens), min(target_tokens, len_tokens))
                         for i, token in enumerate(tokens):
@@ -1523,46 +1585,56 @@ class BaseDataset(torch.utils.data.Dataset):
                     if len(l) > 10:
                         if random.random() < 0.05:
                             l += ["detailed caption"]
-                    if random.random() < 0.03:
+                    if random.random() < 0.003:
                         # add random alphanum (5~10 characters)
                         l.append(create_very_random_alphanumeric(random.randint(5, 10)))
+                    if random.random() < 0.005:
+                        l.append("the image") 
                     # for tokens, randomly capitalize or uncapitalize first letter
                     for i, token in enumerate(l):
                         if token.startswith("pixiv_"):
                             token = token.replace("pixiv_", "artist:")
                         if random.random() < 0.1:
                             if random.random() < 0.1:
-                                l[i] = token.capitalize()
+                                token = token.capitalize()
                             else:
-                                l[i] = token.lower()
+                                token = token.lower()
                         if "-" in token:
                             if random.random() < 0.5:
-                                l[i] = token.replace("-", " ")
+                                token = token.replace("-", " ")
                         if "_" in token:
                             if random.random() < 0.5:
-                                l[i] = token.replace("_", " ")
+                                token = token.replace("_", " ")
                         elif " " in token:
                             if random.random() < 0.2:
-                                l[i] = token.replace(" ", "_")
+                                token = token.replace(" ", "_")
+                        if r"\(" in token:
+                            token= token.replace(r"\(", "(")
+                        if r"\)" in token:
+                            token = token.replace(r"\)", ")")
+                        l[i] = token.strip()
+                    log_every(f"Dropout tags: {tokens} -> {l}, no_dropout_tokens: {no_dropout_tokens_additional}", 1201)
                     return l
 
                 #if subset.shuffle_caption:
                 #    random.shuffle(flex_tokens)
                 initial_flex_tokens = flex_tokens[:] # copy
-                flex_tokens = dropout_coocurrence(flex_tokens)
-                flex_tokens = dropout_tags(flex_tokens)
-                flex_tokens = dropout_copyright_or_year(flex_tokens)
-                flex_tokens = set(flex_tokens) + set(triggers)
-                flex_tokens = list(flex_tokens)
+                flex_tokens = dropout_coocurrence(flex_tokens, triggers)
+                flex_tokens = dropout_tags(flex_tokens, triggers)
+                flex_tokens = dropout_copyright_or_year(flex_tokens, triggers)
+                flex_tokens = set(t.replace("_", " ") for t in flex_tokens if t.strip())  # remove empty strings and replace _ with space
+                triggers = set(t.replace("_", " ") for t in triggers if t.strip())  # remove empty strings and replace _ with space
+                # add triggers
+                flex_tokens = list(flex_tokens.union(triggers))
                 fixed_tokens, flex_tokens = convert_tags_if_needed(fixed_tokens), convert_tags_if_needed(flex_tokens)
                 # by random chance, use different join
                 if random.random() < 0.5:
                     caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
-                elif random.random() < 0.05:
+                elif random.random() < 0.001:
                     caption = " ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
                 else:
                     caption = ",".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
-                log_every(f"Initial flex tokens: {initial_flex_tokens}, result: {caption}", 300)
+                log_every(f"Initial flex tokens: {initial_flex_tokens}, result: {caption}, triggers: {triggers}", 1201)
 
             # process secondary separator
             if subset.secondary_separator:
@@ -1580,7 +1652,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     caption = caption.replace(str_from, str_to)
         if not is_drop_out and subset.caption_tag_dropout_rate == 0 and subset.token_warmup_step == 0:
             assert caption, "caption should not be empty if not dropout, warmup, or tag dropout"
-        log_every(f"caption: {caption}, {subset.shuffle_caption}", 1500)
+        log_every(f"final caption: {caption}, {subset.shuffle_caption}", 1501)
         return caption
 
     def get_input_ids(self, caption, tokenizer=None):
