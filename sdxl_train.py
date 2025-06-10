@@ -624,6 +624,9 @@ def train(args):
                     loss = loss.mean([1, 2, 3])
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
+                    
+                    loss_weight_timestep_weighted = train_util.dynamic_loss_weight_smooth(timesteps) 
+                    loss = loss * loss_weight_timestep_weighted
                     if args.fourier_loss_weight > 0:
                         freq_loss = fourier_highfreq_loss(noise_pred.float(), target.float(), reduction="none")
                         loss = loss + args.fourier_loss_weight * freq_loss
