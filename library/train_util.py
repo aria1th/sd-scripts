@@ -106,6 +106,33 @@ TOKENIZER_PATH = "openai/clip-vit-large-patch14"
 V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"  # ここからtokenizerだけ使う v2とv2.1はtokenizer仕様は同じ
 
 HIGH_VRAM = False
+_TIMESTEPS = torch.tensor(
+    [   0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
+    dtype=torch.float32
+)
+_WEIGHTS = torch.tensor(
+    [2.26, 2.88, 2.67, 2.65, 2.26, 2.07, 1.77, 1.63, 1.31, 1.18, 1.16],
+    dtype=torch.float32
+)
+_coeffs = torch.tensor(
+    [2.318811, 6.23986e-3, -2.47896e-5, 2.74359e-8, -1.00816e-11],
+    dtype=torch.float32
+)
+
+
+def _anchors_like(x: torch.Tensor):
+    device = x.device
+    return _TIMESTEPS.to(device), _WEIGHTS.to(device)
+
+def dynamic_loss_weight_smooth(t):
+    t = torch.as_tensor(t, dtype=torch.float32)
+    powers = torch.stack([t**k for k in range(5)])  # shape (5, *t.shape)
+    poly = (_coeffs.to(t.device).unsqueeze(-1).unsqueeze(-1) * powers).sum(dim=0)
+
+    bump = 1.55 * torch.exp(-((t - 35.0) ** 2) / (2.0 * 20.0 ** 2))
+    w = poly + bump
+
+    return w.clamp_(1.0, 4.5)
 
 # checkpointファイル名
 EPOCH_STATE_NAME = "{}-{:06d}-state"
@@ -183,11 +210,8 @@ CONVERTABLE_DICT = {
     "explicit" : ["explicit", "nsfw", "with nudity", "adult content", "explicit material"],
 }
 COOCC_PATH="character_cooccurrence_sigmoid.json"
-if not os.path.exists(COOCC_PATH):
-    CHAR_COOCCURRENCE_DROPOUT = {}
-else:
-    with open(COOCC_PATH, 'r', encoding='utf-8') as f:
-        CHAR_COOCCURRENCE_DROPOUT = json.load(f)
+with open(COOCC_PATH, 'r', encoding='utf-8') as f:
+    CHAR_COOCCURRENCE_DROPOUT = json.load(f)
 
 popular_chars_names = ["momiji", "character", "futo", "inaba", "yor", "seija", "stout", "sakuya", "yazawa", "tamamo", "ellen", "d'arc", "murasa", "misaka", "hearn", "kisaragi", "kaku", "ichinose", "hatate", "suwako", "douji", "aqua", "yoko", "samidare", "kikuchi", "nilou", "yuyuko", "sekibanki", "asashio", "rumia", "megurine", "kotori", "formidable", "frieren", "satori", "shijou", "kyrielight", "kanako", "remilia", "koakuma", "gardevoir", "littner", "princess", "d.va", "saber", "higuchi", "koishi", "bridget", "minami", "inkling", "monster", "kokomi", "miho", "kasodani", "houraisan", "kongou", "artoria", "chen", "pyra", "patchouli", "konpaku", "tojo", "mercury", "shinobu", "tewi", "suika", "izumi", "shiroko", "inazuma", "kurodani", "akemi", "fujiwara", "mononobe", "kokoro", "nagae", "azusa", "youmu", "kafka", "c.c.", "arisu", "abigail", "yumemi", "manhattan", "mona", "shirakami", "zhongli", "shibuya", "kawashiro", "kaenbyou", "zero", "nakano", "yuudachi", "tao", "eula", "hoshimachi", "kasen", "raiden", "yuugi", "takane", "murakumo", "hoshii", "watanabe", "rio", "minamoto", "kaname", "minato", "pendragon", "williams", "udongein", "shower", "super", "ryuuko", "himekaidou", "mirko", "cammy", "sayaka", "riamu", "reimu", "yasaka", "komeiji", "nightbug", "tachyon", "kokichi", "lumine", "utsuho", "rem", "tatsumaki", "shimamura", "sonoda", "takagaki", "shenhe", "kagerou", "miki", "houjuu", "lillie", "nagato", "senketsu", "amami", "player", "byakuren", "junko", "asuna", "kashima", "komachi", "kinomoto", "power", "kagamine", "kirisame", "kogasa", "sanae", "souji", "nico", "seiga", "mokou", "aran", "iono", "usami", "nazrin", "akiyama", "kamisato", "joe", "miku", "nozomi", "shooter", "nahida", "luka", "mythra", "claudius", "kyoko", "yagokoro", "iku", "aya", "kaede", "takina", "morrigan", "amiya", "gokou", "yoshika", "suzuya", "dawn", "kamishirasawa", "shuten", "okita", "joseph", "reisalin", "ruri", "haruka", "nitori", "marnie", "plana", "renko", "shameimaru", "samus", "makoto", "holo", "doll", "yuuka", "hinanawi", "hatsune", "shiranui", "daiyousei", "kanzaki", "magician", "rembran", "reiuji", "jougasaki", "tohsaka", "maki", "ibuki", "karin", "kai", "oshino", "koharu", "bowsette", "eiki", "toki", "ayaka", "sagiri", "yelan", "zeppeli", "zelda", "wriggle", "hata", "ganaha", "saigyouji", "shimakaze", "mayuzumi", "shogun", "lorelei", "einzbern", "fuyuko", "knowledge", "sonico", "tifa", "rensouhou-chan", "rin", "kyouko", "kaguya", "serval", "nino", "ranko", "madoka", "flandre", "kisaki", "hong", "illyasviel", "koume", "hamakaze", "chun-li", "miko", "oyama", "shanghai", "joestar", "uzuki", "umi", "yui", "kaga", "tomoe", "mika", "mash", "ganyu", "ibaraki", "fubuki", "miorine", "ayanami", "arona", "2b", "boo", "eirin", "kazusa", "mio", "aensland", "anthonio", "von", "meiling", "parsee", "tachibana", "warrior", "kitagawa", "fumika", "marine", "yamame", "alter", "marisa", "rikka", "megumin", "moriya", "sparkle", "nishizumi", "matoi", "takao", "raikou", "briar", "minamitsu", "rei", "imaizumi", "asuka", "kazami", "hk416", "shiki", "nero", "keine", "amatsukaze", "karyl", "hina", "chino", "mari", "nanami", "izayoi", "yae", "onozuka", "nishikigi", "nishikino", "yamato", "makima", "suigintou", "sagisawa","mizuhashi", "yotsuba", "chiaki", "margatroid", "ushio", "mikoto", "ayase", "mai", "hitori", "venti", "agnes", "scathach", "yoimiya", "gawr", "sagume", "ooyodo", "reisen", "chihaya", "haruhi", "gumi", "akagi", "souryuu", "hirasawa", "homura", "shigure", "hibiki", "yuzuki", "acheron", "link", "sakura", "ryuujou", "atago", "inubashiri", "mami", "nue", "yukari", "eugen", "jeanne", "gura", "firefly", "hestia", "anchovy", "haruna", "aru", "houshou", "gotoh", "akatsuki", "kishin", "alice", "kijin", "hijiri", "kagiyama", "yakumo", "suisei", "ro-500", "keqing", "testarossa", "scarlet", "iowa", "suletta", "tenshi", "langley", "lockhart", "tatara", "mystia", "adachi", "rosa", "hoshiguma", "yuki", "hakurei", "furina", "daiwa", "mahiro", "aris", "suzumiya", "kochiya", "inoue", "fate", "nami", "hunter", "tenryuu", "shirasaka", "astolfo", "caesar", "prinz", "marin", "toyosatomimi", "kafuu", "takarada", "hoshino", "clownpiece", "cynthia", "miyako", "darjeeling", "sangonomiya", "chisato", "rice", "ikazuchi", "cirno", "maribel", "mizumiya", "niko", "kikirara", "riona"]
 strict_no_dropout_tokens_initial = [
@@ -210,7 +234,6 @@ strict_no_dropout_tokens_initial = [
     "jaggy",
     #"close up",
     #"close-up",
-    "cropped",
     "empty",
     "plain",
     # "from ",
@@ -233,7 +256,10 @@ strict_no_dropout_tokens_initial = [
     "3d",
     "render",
     "logo",
-    "artist",
+    "artist name",
+    "twitter username",
+    "weibo",
+    "copyright name",
     "sign",
     "username",
     "parody",
@@ -270,18 +296,16 @@ strict_no_dropout_tokens_initial = [
     "2boy",
     "3girl",
     "3boy",
-    "artist",
     "character",
-    "style",
     "4girl",
     "4boy",
     "5girl",
     "5boy",
     "6+girl",
+    "1girl",
+    "1boy",
     "6+boy",
-    "female",
     "cosplay",
-    "male",
     "other",
     "explicit",
     "questionable",
@@ -289,27 +313,34 @@ strict_no_dropout_tokens_initial = [
     "underwear",
     "panties",
     "pubic",
-    "topless",
     "scat",
     "guro",
     "(meme)",
+    "blurry",
+    "nude",
 #    "background",
     "abstract",
+    "cameltoe",
     "monochrome", "single toned", "gradient with one color",
     "greyscale",
     "various",
     "cleft",
-    "ass",
     "areola",
     "pectoral",
     "koma",
     "photo",
     "real",
-    "focus",
     "panties",
     "underwear",
     "bulge",
     "pectoral",
+    "speech bubble",
+    "text",
+    "logo",
+    "dated",
+    "web address",
+    "artist ",
+    " style",
     "ai-generated" # mark the image is generated by AI
 ] + [
     "pus"+ "sy",
@@ -451,8 +482,9 @@ class ImageInfo:
     
     def get_loss_weight(self, caption: Optional[str] = None):
         caption = caption or self.get_caption()
+        caption = caption.replace(" ", "_").lower()
         matching_weights = [
-            weight for key, weight in LOSS_WEIGHTS_CONDITIONS.items() if key in caption.replace(" ", "_")
+            weight for key, weight in LOSS_WEIGHTS_CONDITIONS.items() if key in caption
         ]
         if matching_weights:
             log_every(f"Using loss weight {max(matching_weights)} for caption: {caption}, {self.image_key}", 601)
@@ -554,6 +586,7 @@ def dropout_coocurrence(tokens, no_dropout_tokens_additional=None):
     # we will recover them after dropout
     
     char_tags = [t for t in tokens_underbar if t in CHAR_COOCCURRENCE_DROPOUT] # ["alice", ...]
+    tokens_underbar = [t for t in tokens_underbar if t not in CHAR_COOCCURRENCE_DROPOUT] # ["1girl", "smile", ...]
     if len(char_tags) == 0:
         return tokens
     char_tags = set(char_tags)
@@ -566,6 +599,12 @@ def dropout_coocurrence(tokens, no_dropout_tokens_additional=None):
                 merged_dict[token] = max(merged_dict.get(token, 0), CHAR_COOCCURRENCE_DROPOUT[char_tag]["tags"][token]["ratio"])
     if len(merged_dict) == 0:
         return tokens # no coocurrence
+    
+    # cleanup char_tags
+    # if any of the tag is a_( or a_\( -> find if a is in char_tags, if so, remove it
+    char_variants = [t.split("_(")[0] for t in char_tags if "_(" in t] + [t.split("_\\(")[0] for t in char_tags if "_\\(" in t]
+    char_tags = [t for t in char_tags if t not in char_variants]
+    
     # dropout
     selected = []
     prevented_tokens, causes = [], []
@@ -587,6 +626,7 @@ def dropout_coocurrence(tokens, no_dropout_tokens_additional=None):
             selected.append(token)
     selected = set(selected) # remove duplicates
     selected = list(selected)
+    selected = selected + char_tags # add character tags back
     dropped_tokens = set(tokens_underbar) - set(selected)
     log_every(f"CHAR_COOCCURRENCE_DROPOUT: {dropped_tokens}, char_tags : {char_tags}, prevented_tokens: {prevented_tokens}, causes: {causes}", 501)
     return selected
@@ -1476,9 +1516,13 @@ class BaseDataset(torch.utils.data.Dataset):
                 def dropout_tags(tokens, no_dropout_tokens_additional=None):
                     assert isinstance(tokens, list), f"tokens must be a list, but got {type(tokens)} with {tokens}"
                     # drop until token length gets smaller than 225 (hardcoded here)
+                    # character or artist tags should not be dropped
                     if len(tokens) > 225:
-                        while len(tokens) > 225:
-                            tokens.pop(random.randint(0, len(tokens) - 1))
+                        char_tokens = [t for t in tokens if t.startswith("character:") or t.startswith("artist:")]
+                        others = [t for t in tokens if not (t.startswith("character:") or t.startswith("artist:"))]
+                        while len(others) > 225:
+                            others.pop(random.randint(0, len(others) - 1))
+                        tokens = char_tokens + others # recover
                     if subset.caption_tag_dropout_rate <= 0 or not subset.shuffle_caption:
                         return tokens
                     l = []
@@ -1494,6 +1538,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         "nsfw",
                         "nudity",
                         "pussy",
+                        "speculum",
                         "penis",
                         "nipple",
                         "pectoral",
@@ -1630,8 +1675,11 @@ class BaseDataset(torch.utils.data.Dataset):
                 # by random chance, use different join
                 if random.random() < 0.5:
                     caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
-                elif random.random() < 0.001:
-                    caption = " ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+                elif random.random() < 0.3:
+                    all_tokens = fixed_tokens + flex_tokens + fixed_suffix_tokens
+                    # convert space to underscore
+                    all_tokens = [t.replace(" ", "_") for t in all_tokens if t.strip()]
+                    caption = " ".join(all_tokens)
                 else:
                     caption = ",".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
                 log_every(f"Initial flex tokens: {initial_flex_tokens}, result: {caption}, triggers: {triggers}", 1201)
