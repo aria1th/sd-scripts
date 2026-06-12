@@ -115,9 +115,15 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 | `max_bucket_reso` | `1024` | o | o |
 | `min_bucket_reso` | `128` | o | o |
 | `resolution` | `256`, `[512, 512]` | o | o |
+| `skip_image_resolution` | `768`, `[512, 768]` | o | o |
 
 * `batch_size`
     * コマンドライン引数の `--train_batch_size` と同等です。
+* `max_bucket_reso`, `min_bucket_reso`
+    * bucketの最大、最小解像度を指定します。`bucket_reso_steps` で割り切れる必要があります。
+* `skip_image_resolution`
+    * 指定した解像度（面積）以下の画像をスキップします。`'サイズ'` または `[幅, 高さ]` で指定します。コマンドライン引数の `--skip_image_resolution` と同等です。
+    * 同じ画像ディレクトリを異なる解像度の複数のデータセットで使い回す場合に、低解像度の元画像を高解像度のデータセットから除外するために使用します。
 
 これらの設定はデータセットごとに固定です。
 つまり、データセットに所属するサブセットはこれらの設定を共有することになります。
@@ -142,6 +148,7 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 | `keep_tokens_separator` | `“|||”` | o | o | o |
 | `secondary_separator` | `“;;;”` | o | o | o |
 | `enable_wildcard` | `true` | o | o | o |
+| `resize_interpolation` |（通常は設定しません） | o | o | o |
 
 * `num_repeats`
     * サブセットの画像の繰り返し回数を指定します。fine tuning における `--dataset_repeats` に相当しますが、`num_repeats` はどの学習方法でも指定可能です。
@@ -159,6 +166,9 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 
 * `enable_wildcard`
     * ワイルドカード記法および複数行キャプションを有効にします。ワイルドカード記法、複数行キャプションについては後述します。
+
+* `resize_interpolation`
+    * 画像のリサイズ時に使用する補間方法を指定します。通常は指定しなくて構いません。`lanczos`, `nearest`, `bilinear`, `linear`, `bicubic`, `cubic`, `area`, `box` が指定可能です。デフォルト（未指定時）は、縮小時は `area`、拡大時は `lanczos` になります。このオプションを指定すると、拡大時・縮小時とも同じ補間方法が使用されます。`lanczos`、`box`を指定するとPILが、それ以外を指定するとOpenCVが使用されます。
 
 ### DreamBooth 方式専用のオプション
 
@@ -210,6 +220,7 @@ fine tuning 方式のサブセットの設定に関わるオプションです�
 * `metadata_file`
     * サブセットで利用されるメタデータファイルのパスを指定します。指定必須オプションです。
         * コマンドライン引数の `--in_json` と同等です。
+        * メタデータファイルの形式（学習スクリプトが読み込むフィールド）については、[fine-tuning メタデータファイル仕様](./dataset_metadata.md) を参照してください。
     * サブセットごとにメタデータファイルを指定する必要がある仕様上、ディレクトリを跨いだメタデータを1つのメタデータファイルとして作成することは避けた方が良いでしょう。画像ディレクトリごとにメタデータファイルを用意し、それらを別々のサブセットとして登録することを強く推奨します。
 
 ### caption dropout の手法が使える場合に指定可能なオプション
@@ -253,6 +264,34 @@ resolution = 768
   image_dir = 'C:\hoge'
 ```
 
+なお、マルチ解像度データセットでは `skip_image_resolution` を使用して、元の画像サイズが小さい画像を高解像度データセットから除外できます。これにより、低解像度画像のデータセット間での重複を防ぎ、学習品質を向上させることができます。また、小さい画像を除外するフィルターとしても機能します。
+
+```toml
+[general]
+enable_bucket = true
+bucket_no_upscale = true
+max_bucket_reso = 1536
+
+[[datasets]]
+resolution = 768
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+[[datasets]]
+resolution = 1024
+skip_image_resolution = 768
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+[[datasets]]
+resolution = 1280
+skip_image_resolution = 1024
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+```
+
+この例では、1024 解像度のデータセットでは元の画像サイズが 768x768 以下の画像がスキップされ、1280 解像度のデータセットでは 1024x1024 以下の画像がスキップされます。
+
 ## コマンドライン引数との併用
 
 設定ファイルのオプションの中には、コマンドライン引数のオプションと役割が重複しているものがあります。
@@ -283,6 +322,7 @@ resolution = 768
 | `--random_crop`                    |                                    |
 | `--resolution`                     |                                    |
 | `--shuffle_caption`                |                                    |
+| `--skip_image_resolution`          |                                    |
 | `--train_batch_size`               | `batch_size`                       |
 
 ## エラーの手引き

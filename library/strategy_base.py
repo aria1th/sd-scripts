@@ -1,16 +1,15 @@
 # base class for platform strategies. this file defines the interface for strategies
 
 import os
-from typing import Any, List, Optional, Tuple, Union
+import re
+from typing import Any, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 
 
-# TODO remove circular import by moving ImageInfo to a separate file
-# from library.train_util import ImageInfo
-
+from library import caching
 from library.utils import setup_logging
 
 setup_logging()
@@ -21,6 +20,24 @@ logger = logging.getLogger(__name__)
 
 class TokenizeStrategy:
     _strategy = None  # strategy instance: actual strategy class
+
+    _re_attention = re.compile(
+        r"""\\\(|
+\\\)|
+\\\[|
+\\]|
+\\\\|
+\\|
+\(|
+\[|
+:([+-]?[.\d]+)\)|
+\)|
+]|
+[^\\()\[\]:]+|
+:
+""",
+        re.X,
+    )
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -54,7 +71,154 @@ class TokenizeStrategy:
     def tokenize(self, text: Union[str, List[str]]) -> List[torch.Tensor]:
         raise NotImplementedError
 
-    def _get_input_ids(self, tokenizer: CLIPTokenizer, text: str, max_length: Optional[int] = None) -> torch.Tensor:
+    def tokenize_with_weights(self, text: Union[str, List[str]]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        returns: [tokens1, tokens2, ...], [weights1, weights2, ...]
+        """
+        raise NotImplementedError
+
+    def _get_weighted_input_ids(
+        self, tokenizer: CLIPTokenizer, text: str, max_length: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        max_length includes starting and ending tokens.
+        """
+
+        def parse_prompt_attention(text):
+            """
+            Parses a string with attention tokens and returns a list of pairs: text and its associated weight.
+            Accepted tokens are:
+            (abc) - increases attention to abc by a multiplier of 1.1
+            (abc:3.12) - increases attention to abc by a multiplier of 3.12
+            [abc] - decreases attention to abc by a multiplier of 1.1
+            \( - literal character '('
+            \[ - literal character '['
+            \) - literal character ')'
+            \] - literal character ']'
+            \\ - literal character '\'
+            anything else - just text
+            >>> parse_prompt_attention('normal text')
+            [['normal text', 1.0]]
+            >>> parse_prompt_attention('an (important) word')
+            [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
+            >>> parse_prompt_attention('(unbalanced')
+            [['unbalanced', 1.1]]
+            >>> parse_prompt_attention('\(literal\]')
+            [['(literal]', 1.0]]
+            >>> parse_prompt_attention('(unnecessary)(parens)')
+            [['unnecessaryparens', 1.1]]
+            >>> parse_prompt_attention('a (((house:1.3)) [on] a (hill:0.5), sun, (((sky))).')
+            [['a ', 1.0],
+            ['house', 1.5730000000000004],
+            [' ', 1.1],
+            ['on', 1.0],
+            [' a ', 1.1],
+            ['hill', 0.55],
+            [', sun, ', 1.1],
+            ['sky', 1.4641000000000006],
+            ['.', 1.1]]
+            """
+
+            res = []
+            round_brackets = []
+            square_brackets = []
+
+            round_bracket_multiplier = 1.1
+            square_bracket_multiplier = 1 / 1.1
+
+            def multiply_range(start_position, multiplier):
+                for p in range(start_position, len(res)):
+                    res[p][1] *= multiplier
+
+            for m in TokenizeStrategy._re_attention.finditer(text):
+                text = m.group(0)
+                weight = m.group(1)
+
+                if text.startswith("\\"):
+                    res.append([text[1:], 1.0])
+                elif text == "(":
+                    round_brackets.append(len(res))
+                elif text == "[":
+                    square_brackets.append(len(res))
+                elif weight is not None and len(round_brackets) > 0:
+                    multiply_range(round_brackets.pop(), float(weight))
+                elif text == ")" and len(round_brackets) > 0:
+                    multiply_range(round_brackets.pop(), round_bracket_multiplier)
+                elif text == "]" and len(square_brackets) > 0:
+                    multiply_range(square_brackets.pop(), square_bracket_multiplier)
+                else:
+                    res.append([text, 1.0])
+
+            for pos in round_brackets:
+                multiply_range(pos, round_bracket_multiplier)
+
+            for pos in square_brackets:
+                multiply_range(pos, square_bracket_multiplier)
+
+            if len(res) == 0:
+                res = [["", 1.0]]
+
+            # merge runs of identical weights
+            i = 0
+            while i + 1 < len(res):
+                if res[i][1] == res[i + 1][1]:
+                    res[i][0] += res[i + 1][0]
+                    res.pop(i + 1)
+                else:
+                    i += 1
+
+            return res
+
+        def get_prompts_with_weights(text: str, max_length: int):
+            r"""
+            Tokenize a list of prompts and return its tokens with weights of each token. max_length does not include starting and ending token.
+
+            No padding, starting or ending token is included.
+            """
+            truncated = False
+
+            texts_and_weights = parse_prompt_attention(text)
+            tokens = []
+            weights = []
+            for word, weight in texts_and_weights:
+                # tokenize and discard the starting and the ending token
+                token = tokenizer(word).input_ids[1:-1]
+                tokens += token
+                # copy the weight by length of token
+                weights += [weight] * len(token)
+                # stop if the text is too long (longer than truncation limit)
+                if len(tokens) > max_length:
+                    truncated = True
+                    break
+            # truncate
+            if len(tokens) > max_length:
+                truncated = True
+                tokens = tokens[:max_length]
+                weights = weights[:max_length]
+            if truncated:
+                logger.warning("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
+            return tokens, weights
+
+        def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, pad):
+            r"""
+            Pad the tokens (with starting and ending tokens) and weights (with 1.0) to max_length.
+            """
+            tokens = [bos] + tokens + [eos] + [pad] * (max_length - 2 - len(tokens))
+            weights = [1.0] + weights + [1.0] * (max_length - 1 - len(weights))
+            return tokens, weights
+
+        if max_length is None:
+            max_length = tokenizer.model_max_length
+
+        tokens, weights = get_prompts_with_weights(text, max_length - 2)
+        tokens, weights = pad_tokens_and_weights(
+            tokens, weights, max_length, tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
+        )
+        return torch.tensor(tokens).unsqueeze(0), torch.tensor(weights).unsqueeze(0)
+
+    def _get_input_ids(
+        self, tokenizer: CLIPTokenizer, text: str, max_length: Optional[int] = None, weighted: bool = False
+    ) -> torch.Tensor:
         """
         for SD1.5/2.0/SDXL
         TODO support batch input
@@ -62,7 +226,10 @@ class TokenizeStrategy:
         if max_length is None:
             max_length = tokenizer.model_max_length - 2
 
-        input_ids = tokenizer(text, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt").input_ids
+        if weighted:
+            input_ids, weights = self._get_weighted_input_ids(tokenizer, text, max_length)
+        else:
+            input_ids = tokenizer(text, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt").input_ids
 
         if max_length > tokenizer.model_max_length:
             input_ids = input_ids.squeeze(0)
@@ -101,6 +268,17 @@ class TokenizeStrategy:
                     iids_list.append(ids_chunk)
 
             input_ids = torch.stack(iids_list)  # 3,77
+
+            if weighted:
+                weights = weights.squeeze(0)
+                new_weights = torch.ones(input_ids.shape)
+                for i in range(1, max_length - tokenizer.model_max_length + 2, tokenizer.model_max_length - 2):
+                    b = i // (tokenizer.model_max_length - 2)
+                    new_weights[b, 1 : 1 + tokenizer.model_max_length - 2] = weights[i : i + tokenizer.model_max_length - 2]
+                weights = new_weights
+
+        if weighted:
+            return input_ids, weights
         return input_ids
 
 
@@ -127,17 +305,34 @@ class TextEncodingStrategy:
         """
         raise NotImplementedError
 
+    def encode_tokens_with_weights(
+        self, tokenize_strategy: TokenizeStrategy, models: List[Any], tokens: List[torch.Tensor], weights: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """
+        Encode tokens into embeddings and outputs.
+        :param tokens: list of token tensors for each TextModel
+        :param weights: list of weight tensors for each TextModel
+        :return: list of output embeddings for each architecture
+        """
+        raise NotImplementedError
+
 
 class TextEncoderOutputsCachingStrategy:
     _strategy = None  # strategy instance: actual strategy class
 
     def __init__(
-        self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, is_partial: bool = False
+        self,
+        cache_to_disk: bool,
+        batch_size: Optional[int],
+        skip_disk_cache_validity_check: bool,
+        is_partial: bool = False,
+        is_weighted: bool = False,
     ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
         self._is_partial = is_partial
+        self._is_weighted = is_weighted
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -161,6 +356,10 @@ class TextEncoderOutputsCachingStrategy:
     def is_partial(self):
         return self._is_partial
 
+    @property
+    def is_weighted(self):
+        return self._is_weighted
+
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 
@@ -180,6 +379,8 @@ class LatentsCachingStrategy:
     # TODO commonize utillity functions to this class, such as npz handling etc.
 
     _strategy = None  # strategy instance: actual strategy class
+
+    _warned_fallback_to_old_npz = False  # to avoid spamming logs about fallback
 
     def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
         self._cache_to_disk = cache_to_disk
@@ -204,8 +405,13 @@ class LatentsCachingStrategy:
     def batch_size(self):
         return self._batch_size
 
-    def get_image_size_from_disk_cache_path(self, absolute_path: str) -> Tuple[Optional[int], Optional[int]]:
+    @property
+    def cache_suffix(self):
         raise NotImplementedError
+
+    def get_image_size_from_disk_cache_path(self, absolute_path: str, npz_path: str) -> Tuple[Optional[int], Optional[int]]:
+        w, h = os.path.splitext(npz_path)[0].split("_")[-2].split("x")
+        return int(w), int(h)
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         raise NotImplementedError
@@ -224,9 +430,21 @@ class LatentsCachingStrategy:
         bucket_reso: Tuple[int, int],
         npz_path: str,
         flip_aug: bool,
-        alpha_mask: bool,
+        apply_alpha_mask: bool,
         multi_resolution: bool = False,
-    ):
+    ) -> bool:
+        """
+        Args:
+            latents_stride: stride of latents
+            bucket_reso: resolution of the bucket
+            npz_path: path to the npz file
+            flip_aug: whether to flip images
+            apply_alpha_mask: whether to apply alpha mask
+            multi_resolution: whether to use multi-resolution latents
+
+        Returns:
+            bool
+        """
         if not self.cache_to_disk:
             return False
         if not os.path.exists(npz_path):
@@ -241,11 +459,14 @@ class LatentsCachingStrategy:
 
         try:
             npz = np.load(npz_path)
-            if "latents" + key_reso_suffix not in npz:
+
+            # In old SD/SDXL npz files, if the actual latents shape does not match the expected shape, it doesn't raise an error as long as "latents" key exists (backward compatibility)
+            # In non-SD/SDXL npz files (multi-resolution support), the latents key always has the resolution suffix, and no latents key without suffix exists, so it raises an error if the expected resolution suffix key is not found (this doesn't change the behavior for non-SD/SDXL npz files).
+            if "latents" + key_reso_suffix not in npz and "latents" not in npz:
                 return False
-            if flip_aug and "latents_flipped" + key_reso_suffix not in npz:
+            if flip_aug and ("latents_flipped" + key_reso_suffix not in npz and "latents_flipped" not in npz):
                 return False
-            if alpha_mask and "alpha_mask" + key_reso_suffix not in npz:
+            if apply_alpha_mask and ("alpha_mask" + key_reso_suffix not in npz and "alpha_mask" not in npz):
                 return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
@@ -256,22 +477,33 @@ class LatentsCachingStrategy:
     # TODO remove circular dependency for ImageInfo
     def _default_cache_batch_latents(
         self,
-        encode_by_vae,
-        vae_device,
-        vae_dtype,
+        encode_by_vae: Callable,
+        vae_device: torch.device,
+        vae_dtype: torch.dtype,
         image_infos: List,
         flip_aug: bool,
-        alpha_mask: bool,
+        apply_alpha_mask: bool,
         random_crop: bool,
         multi_resolution: bool = False,
     ):
         """
         Default implementation for cache_batch_latents. Image loading, VAE, flipping, alpha mask handling are common.
-        """
-        from library import train_util  # import here to avoid circular import
 
-        img_tensor, alpha_masks, original_sizes, crop_ltrbs = train_util.load_images_and_masks_for_caching(
-            image_infos, alpha_mask, random_crop
+        Args:
+            encode_by_vae: function to encode images by VAE
+            vae_device: device to use for VAE
+            vae_dtype: dtype to use for VAE
+            image_infos: list of ImageInfo
+            flip_aug: whether to flip images
+            apply_alpha_mask: whether to apply alpha mask
+            random_crop: whether to random crop images
+            multi_resolution: whether to use multi-resolution latents
+
+        Returns:
+            None
+        """
+        img_tensor, alpha_masks, original_sizes, crop_ltrbs = caching.load_images_and_masks_for_caching(
+            image_infos, apply_alpha_mask, random_crop
         )
         img_tensor = img_tensor.to(device=vae_device, dtype=vae_dtype)
 
@@ -293,7 +525,7 @@ class LatentsCachingStrategy:
             original_size = original_sizes[i]
             crop_ltrb = crop_ltrbs[i]
 
-            latents_size = latents.shape[1:3]  # H, W
+            latents_size = latents.shape[-2:]  # H, W (supports both 4D and 5D latents)
             key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}" if multi_resolution else ""  # e.g. "_32x64", HxW
 
             if self.cache_to_disk:
@@ -312,22 +544,59 @@ class LatentsCachingStrategy:
         self, npz_path: str, bucket_reso: Tuple[int, int]
     ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        for SD/SDXL/SD3.0
+        For single resolution architectures (currently no architecture is single resolution specific). Kept for reference.
+
+        Args:
+            npz_path (str): Path to the npz file.
+            bucket_reso (Tuple[int, int]): The resolution of the bucket.
+
+        Returns:
+            Tuple[
+                Optional[np.ndarray],
+                Optional[List[int]],
+                Optional[List[int]],
+                Optional[np.ndarray],
+                Optional[np.ndarray]
+            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask
         """
         return self._default_load_latents_from_disk(None, npz_path, bucket_reso)
 
     def _default_load_latents_from_disk(
         self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int]
     ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Args:
+            latents_stride (Optional[int]): Stride for latents. If None, load all latents.
+            npz_path (str): Path to the npz file.
+            bucket_reso (Tuple[int, int]): The resolution of the bucket.
+
+        Returns:
+            Tuple[
+                Optional[np.ndarray],
+                Optional[List[int]],
+                Optional[List[int]],
+                Optional[np.ndarray],
+                Optional[np.ndarray]
+            ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask
+        """
         if latents_stride is None:
             key_reso_suffix = ""
         else:
-            latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
-            key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"  # e.g. "_32x64", HxW
+            expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
+            key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
 
         npz = np.load(npz_path)
         if "latents" + key_reso_suffix not in npz:
-            raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+            # raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+            # Fallback to old npz without resolution suffix
+            if "latents" not in npz:
+                raise ValueError(f"latents not found in {npz_path} (either with or without resolution suffix: {key_reso_suffix})")
+            if not self._warned_fallback_to_old_npz:
+                logger.warning(
+                    f"latents{key_reso_suffix} not found in {npz_path}. Falling back to latents without resolution suffix (old npz). This warning will only be shown once. To avoid this warning, please re-cache the latents with the latest version."
+                )
+                self._warned_fallback_to_old_npz = True
+            key_reso_suffix = ""
 
         latents = npz["latents" + key_reso_suffix]
         original_size = npz["original_size" + key_reso_suffix].tolist()
@@ -346,6 +615,19 @@ class LatentsCachingStrategy:
         alpha_mask=None,
         key_reso_suffix="",
     ):
+        """
+        Args:
+            npz_path (str): Path to the npz file.
+            latents_tensor (torch.Tensor): Latent tensor
+            original_size (List[int]): Original size of the image
+            crop_ltrb (List[int]): Crop left top right bottom
+            flipped_latents_tensor (Optional[torch.Tensor]): Flipped latent tensor
+            alpha_mask (Optional[torch.Tensor]): Alpha mask
+            key_reso_suffix (str): Key resolution suffix
+
+        Returns:
+            None
+        """
         kwargs = {}
 
         if os.path.exists(npz_path):
@@ -354,6 +636,7 @@ class LatentsCachingStrategy:
             for key in npz.files:
                 kwargs[key] = npz[key]
 
+        # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
         kwargs["original_size" + key_reso_suffix] = np.array(original_size)
         kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)

@@ -11,25 +11,36 @@
 # - Per-block fused optimizer instances
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import math
 import os
 from multiprocessing import Value
-from typing import List
+import time
+from typing import List, Optional, Tuple, Union
 import toml
 
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
+from library import utils
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux
-from library.sd3_train_utils import load_prompts, FlowMatchEulerDiscreteScheduler
+from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec
+from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
-import library.train_util as train_util
+import library.accelerator_setup as accelerator_setup
+import library.args as args_util
+import library.dataset as dataset_util
+import library.optimizer as optimizer_util
+import library.logging_util as logging_util
+import library.loss as loss_util
+import library.checkpoint_io as checkpoint_io
+import library.sampling as sampling
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -49,11 +60,15 @@ from library.custom_train_functions import apply_masked_loss, add_custom_train_a
 
 
 def train(args):
-    train_util.verify_training_args(args)
-    train_util.prepare_dataset_args(args, True)
+    args_util.verify_training_args(args)
+    accelerator_setup.prepare_dataset_args(args, True)
     # sdxl_train_util.verify_sdxl_training_args(args)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
+
+    # temporary: backward compatibility for deprecated options. remove in the future
+    if not args.skip_cache_check:
+        args.skip_cache_check = args.skip_latents_validity_check
 
     # assert (
     #     not args.weighted_captions
@@ -70,6 +85,12 @@ def train(args):
         )
         args.gradient_checkpointing = True
 
+    assert (
+        args.blocks_to_swap is None or args.blocks_to_swap == 0
+    ) or not args.cpu_offload_checkpointing, (
+        "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
+    )
+
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
 
@@ -79,7 +100,7 @@ def train(args):
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
         latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_latents_validity_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -124,32 +145,33 @@ def train(args):
                 }
 
         blueprint = blueprint_generator.generate(user_config, args)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
-        train_dataset_group = train_util.load_arbitrary_dataset(args)
+        train_dataset_group = dataset_util.load_arbitrary_dataset(args)
+        val_dataset_group = None
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-    collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
+    collator = dataset_util.collator_class(current_epoch, current_step, ds_for_collator)
 
     train_dataset_group.verify_bucket_reso_steps(16)  # TODO これでいいか確認
 
+    _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
     if args.debug_dataset:
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
                 strategy_flux.FluxTextEncoderOutputsCachingStrategy(
-                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False
+                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
                 )
             )
-        name = "schnell" if "schnell" in args.pretrained_model_name_or_path else "dev"
         t5xxl_max_token_length = (
-            args.t5xxl_max_token_length if args.t5xxl_max_token_length is not None else (256 if name == "schnell" else 512)
+            args.t5xxl_max_token_length if args.t5xxl_max_token_length is not None else (256 if is_schnell else 512)
         )
         strategy_base.TokenizeStrategy.set_strategy(strategy_flux.FluxTokenizeStrategy(t5xxl_max_token_length))
 
         train_dataset_group.set_current_strategies()
-        train_util.debug_dataset(train_dataset_group, True)
+        dataset_util.debug_dataset(train_dataset_group, True)
         return
     if len(train_dataset_group) == 0:
         logger.error(
@@ -169,23 +191,22 @@ def train(args):
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
-    accelerator = train_util.prepare_accelerator(args)
+    accelerator = accelerator_setup.prepare_accelerator(args)
 
     # mixed precisionに対応した型を用意しておき適宜castする
-    weight_dtype, save_dtype = train_util.prepare_dtype(args)
+    weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
 
     # モデルを読み込む
-    name = "schnell" if "schnell" in args.pretrained_model_name_or_path else "dev"
 
     # load VAE for caching latents
     ae = None
     if cache_latents:
-        ae = flux_utils.load_ae(name, args.ae, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
         ae.to(accelerator.device, dtype=weight_dtype)
         ae.requires_grad_(False)
         ae.eval()
 
-        train_dataset_group.new_cache_latents(ae, accelerator.is_main_process)
+        train_dataset_group.new_cache_latents(ae, accelerator)
 
         ae.to("cpu")  # if no sampling, vae can be deleted
         clean_memory_on_device(accelerator.device)
@@ -194,7 +215,7 @@ def train(args):
 
     # prepare tokenize strategy
     if args.t5xxl_max_token_length is None:
-        if name == "schnell":
+        if is_schnell:
             t5xxl_max_token_length = 256
         else:
             t5xxl_max_token_length = 512
@@ -228,7 +249,7 @@ def train(args):
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
 
         with accelerator.autocast():
-            train_dataset_group.new_cache_text_encoder_outputs([clip_l, t5xxl], accelerator.is_main_process)
+            train_dataset_group.new_cache_text_encoder_outputs([clip_l, t5xxl], accelerator)
 
         # cache sample prompt's embeddings to free text encoder's memory
         if args.sample_prompts is not None:
@@ -236,7 +257,7 @@ def train(args):
 
             text_encoding_strategy: strategy_flux.FluxTextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-            prompts = load_prompts(args.sample_prompts)
+            prompts = sampling.load_prompts(args.sample_prompts)
             sample_prompts_te_outputs = {}  # key: prompt, value: text encoder outputs
             with accelerator.autocast(), torch.no_grad():
                 for prompt_dict in prompts:
@@ -256,27 +277,43 @@ def train(args):
         clean_memory_on_device(accelerator.device)
 
     # load FLUX
-    flux = flux_utils.load_flow_model(
-        name, args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors
+    _, flux = flux_utils.load_flow_model(
+        args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors, model_type="flux"
     )
 
     if args.gradient_checkpointing:
-        flux.enable_gradient_checkpointing(args.cpu_offload_checkpointing)
+        flux.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
 
     flux.requires_grad_(True)
 
-    is_swapping_blocks = args.double_blocks_to_swap is not None or args.single_blocks_to_swap is not None
+    # block swap
+
+    # backward compatibility
+    if args.blocks_to_swap is None:
+        blocks_to_swap = args.double_blocks_to_swap or 0
+        if args.single_blocks_to_swap is not None:
+            blocks_to_swap += args.single_blocks_to_swap // 2
+        if blocks_to_swap > 0:
+            logger.warning(
+                "double_blocks_to_swap and single_blocks_to_swap are deprecated. Use blocks_to_swap instead."
+                " / double_blocks_to_swapとsingle_blocks_to_swapは非推奨です。blocks_to_swapを使ってください。"
+            )
+            logger.info(
+                f"double_blocks_to_swap={args.double_blocks_to_swap} and single_blocks_to_swap={args.single_blocks_to_swap} are converted to blocks_to_swap={blocks_to_swap}."
+            )
+            args.blocks_to_swap = blocks_to_swap
+        del blocks_to_swap
+
+    is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
     if is_swapping_blocks:
         # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
         # This idea is based on 2kpr's great work. Thank you!
-        logger.info(
-            f"enable block swap: double_blocks_to_swap={args.double_blocks_to_swap}, single_blocks_to_swap={args.single_blocks_to_swap}"
-        )
-        flux.enable_block_swap(args.double_blocks_to_swap, args.single_blocks_to_swap)
+        logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
+        flux.enable_block_swap(args.blocks_to_swap, accelerator.device)
 
     if not cache_latents:
         # load VAE here if not cached
-        ae = flux_utils.load_ae(name, args.ae, weight_dtype, "cpu")
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu")
         ae.requires_grad_(False)
         ae.eval()
         ae.to(accelerator.device, dtype=weight_dtype)
@@ -315,15 +352,15 @@ def train(args):
                 # determine target layer and block index for each parameter
                 block_type = "other"  # double, single or other
                 if np[0].startswith("double_blocks"):
-                    block_idx = int(np[0].split(".")[1])
+                    block_index = int(np[0].split(".")[1])
                     block_type = "double"
                 elif np[0].startswith("single_blocks"):
-                    block_idx = int(np[0].split(".")[1])
+                    block_index = int(np[0].split(".")[1])
                     block_type = "single"
                 else:
-                    block_idx = -1
+                    block_index = -1
 
-                param_group_key = (block_type, block_idx)
+                param_group_key = (block_type, block_index)
                 if param_group_key not in param_group:
                     param_group[param_group_key] = []
                 param_group[param_group_key].append(p)
@@ -341,14 +378,19 @@ def train(args):
         # prepare optimizers for each group
         optimizers = []
         for group in grouped_params:
-            _, _, optimizer = train_util.get_optimizer(args, trainable_params=[group])
+            _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=[group])
             optimizers.append(optimizer)
         optimizer = optimizers[0]  # avoid error in the following code
 
         logger.info(f"using {len(optimizers)} optimizers for blockwise fused optimizers")
 
+        if optimizer_util.is_schedulefree_optimizer(optimizers[0], args):
+            raise ValueError("Schedule-free optimizer is not supported with blockwise fused optimizers")
+        optimizer_train_fn = lambda: None  # dummy function
+        optimizer_eval_fn = lambda: None  # dummy function
     else:
-        _, _, optimizer = train_util.get_optimizer(args, trainable_params=params_to_optimize)
+        _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=params_to_optimize)
+        optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
     # prepare dataloader
     # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
@@ -381,10 +423,10 @@ def train(args):
     # lr schedulerを用意する
     if args.blockwise_fused_optimizers:
         # prepare lr schedulers for each optimizer
-        lr_schedulers = [train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes) for optimizer in optimizers]
+        lr_schedulers = [optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes) for optimizer in optimizers]
         lr_scheduler = lr_schedulers[0]  # avoid error in the following code
     else:
-        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
     if args.full_fp16:
@@ -433,10 +475,10 @@ def train(args):
     if args.full_fp16:
         # During deepseed training, accelerate not handles fp16/bf16|mixed precision directly via scaler. Let deepspeed engine do.
         # -> But we think it's ok to patch accelerator even if deepspeed is enabled.
-        train_util.patch_accelerator_for_fp16_training(accelerator)
+        accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
 
     # resumeする
-    train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+    args_util.resume_from_local_or_hf_if_specified(accelerator, args)
 
     if args.fused_backward_pass:
         # use fused optimizer for backward pass: other optimizers will be supported in the future
@@ -444,88 +486,20 @@ def train(args):
 
         library.adafactor_fused.patch_adafactor_fused(optimizer)
 
-        double_blocks_to_swap = args.double_blocks_to_swap
-        single_blocks_to_swap = args.single_blocks_to_swap
-        num_double_blocks = 19  # len(flux.double_blocks)
-        num_single_blocks = 38  # len(flux.single_blocks)
-        handled_double_block_indices = set()
-        handled_single_block_indices = set()
-
         for param_group, param_name_group in zip(optimizer.param_groups, param_names):
             for parameter, param_name in zip(param_group["params"], param_name_group):
                 if parameter.requires_grad:
-                    grad_hook = None
 
-                    if double_blocks_to_swap:
-                        if param_name.startswith("double_blocks"):
-                            block_idx = int(param_name.split(".")[1])
-                            if (
-                                block_idx not in handled_double_block_indices
-                                and block_idx >= (num_double_blocks - double_blocks_to_swap) - 1
-                                and block_idx < num_double_blocks - 1
-                            ):
-                                # swap next (already backpropagated) block
-                                handled_double_block_indices.add(block_idx)
-                                block_idx_cpu = block_idx + 1
-                                block_idx_cuda = double_blocks_to_swap - (num_double_blocks - block_idx_cpu)
-
-                                # create swap hook
-                                def create_double_swap_grad_hook(bidx, bidx_cuda):
-                                    def __grad_hook(tensor: torch.Tensor):
-                                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                            accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
-                                        optimizer.step_param(tensor, param_group)
-                                        tensor.grad = None
-
-                                        # swap blocks if necessary
-                                        flux.double_blocks[bidx].to("cpu")
-                                        flux.double_blocks[bidx_cuda].to(accelerator.device)
-                                        # print(f"Move double block {bidx} to cpu and {bidx_cuda} to device")
-
-                                    return __grad_hook
-
-                                grad_hook = create_double_swap_grad_hook(block_idx_cpu, block_idx_cuda)
-                    if single_blocks_to_swap:
-                        if param_name.startswith("single_blocks"):
-                            block_idx = int(param_name.split(".")[1])
-                            if (
-                                block_idx not in handled_single_block_indices
-                                and block_idx >= (num_single_blocks - single_blocks_to_swap) - 1
-                                and block_idx < num_single_blocks - 1
-                            ):
-                                handled_single_block_indices.add(block_idx)
-                                block_idx_cpu = block_idx + 1
-                                block_idx_cuda = single_blocks_to_swap - (num_single_blocks - block_idx_cpu)
-                                # print(param_name, block_idx_cpu, block_idx_cuda)
-
-                                # create swap hook
-                                def create_single_swap_grad_hook(bidx, bidx_cuda):
-                                    def __grad_hook(tensor: torch.Tensor):
-                                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                            accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
-                                        optimizer.step_param(tensor, param_group)
-                                        tensor.grad = None
-
-                                        # swap blocks if necessary
-                                        flux.single_blocks[bidx].to("cpu")
-                                        flux.single_blocks[bidx_cuda].to(accelerator.device)
-                                        # print(f"Move single block {bidx} to cpu and {bidx_cuda} to device")
-
-                                    return __grad_hook
-
-                                grad_hook = create_single_swap_grad_hook(block_idx_cpu, block_idx_cuda)
-
-                    if grad_hook is None:
-
-                        def __grad_hook(tensor: torch.Tensor, param_group=param_group):
+                    def create_grad_hook(p_name, p_group):
+                        def grad_hook(tensor: torch.Tensor):
                             if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                                 accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
-                            optimizer.step_param(tensor, param_group)
+                            optimizer.step_param(tensor, p_group)
                             tensor.grad = None
 
-                        grad_hook = __grad_hook
+                        return grad_hook
 
-                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
 
     elif args.blockwise_fused_optimizers:
         # prepare for additional optimizers and lr schedulers
@@ -542,46 +516,22 @@ def train(args):
         num_parameters_per_group = [0] * len(optimizers)
         parameter_optimizer_map = {}
 
-        double_blocks_to_swap = args.double_blocks_to_swap
-        single_blocks_to_swap = args.single_blocks_to_swap
-        num_double_blocks = 19  # len(flux.double_blocks)
-        num_single_blocks = 38  # len(flux.single_blocks)
-
         for opt_idx, optimizer in enumerate(optimizers):
             for param_group in optimizer.param_groups:
                 for parameter in param_group["params"]:
                     if parameter.requires_grad:
-                        block_type, block_idx = block_types_and_indices[opt_idx]
 
-                        def create_optimizer_hook(btype, bidx):
-                            def optimizer_hook(parameter: torch.Tensor):
-                                # print(f"optimizer_hook: {btype}, {bidx}")
-                                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                    accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
+                        def grad_hook(parameter: torch.Tensor):
+                            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                                accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
 
-                                i = parameter_optimizer_map[parameter]
-                                optimizer_hooked_count[i] += 1
-                                if optimizer_hooked_count[i] == num_parameters_per_group[i]:
-                                    optimizers[i].step()
-                                    optimizers[i].zero_grad(set_to_none=True)
+                            i = parameter_optimizer_map[parameter]
+                            optimizer_hooked_count[i] += 1
+                            if optimizer_hooked_count[i] == num_parameters_per_group[i]:
+                                optimizers[i].step()
+                                optimizers[i].zero_grad(set_to_none=True)
 
-                                    # swap blocks if necessary
-                                    if btype == "double" and double_blocks_to_swap:
-                                        if bidx >= num_double_blocks - double_blocks_to_swap:
-                                            bidx_cuda = double_blocks_to_swap - (num_double_blocks - bidx)
-                                            flux.double_blocks[bidx].to("cpu")
-                                            flux.double_blocks[bidx_cuda].to(accelerator.device)
-                                            # print(f"Move double block {bidx} to cpu and {bidx_cuda} to device")
-                                    elif btype == "single" and single_blocks_to_swap:
-                                        if bidx >= num_single_blocks - single_blocks_to_swap:
-                                            bidx_cuda = single_blocks_to_swap - (num_single_blocks - bidx)
-                                            flux.single_blocks[bidx].to("cpu")
-                                            flux.single_blocks[bidx_cuda].to(accelerator.device)
-                                            # print(f"Move single block {bidx} to cpu and {bidx_cuda} to device")
-
-                            return optimizer_hook
-
-                        parameter.register_post_accumulate_grad_hook(create_optimizer_hook(block_type, block_idx))
+                        parameter.register_post_accumulate_grad_hook(grad_hook)
                         parameter_optimizer_map[parameter] = opt_idx
                         num_parameters_per_group[opt_idx] += 1
 
@@ -620,7 +570,7 @@ def train(args):
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers(
             "finetuning" if args.log_tracker_name is None else args.log_tracker_name,
-            config=train_util.get_sanitized_config_or_none(args),
+            config=args_util.get_sanitized_config_or_none(args),
             init_kwargs=init_kwargs,
         )
 
@@ -628,9 +578,14 @@ def train(args):
         accelerator.unwrap_model(flux).prepare_block_swap_before_forward()
 
     # For --sample_at_first
+    optimizer_eval_fn()
     flux_train_utils.sample_images(accelerator, args, 0, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs)
+    optimizer_train_fn()
+    if len(accelerator.trackers) > 0:
+        # log empty object to commit the sample images to wandb
+        accelerator.log({}, step=0)
 
-    loss_recorder = train_util.LossRecorder()
+    loss_recorder = logging_util.LossRecorder()
     epoch = 0  # avoid error when max_train_steps is 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -651,7 +606,7 @@ def train(args):
                 else:
                     with torch.no_grad():
                         # encode images to latents. images are [-1, 1]
-                        latents = ae.encode(batch["images"])
+                        latents = ae.encode(batch["images"].to(ae.dtype)).to(accelerator.device, dtype=weight_dtype)
 
                     # NaNが含まれていれば警告を表示し0に置き換える
                     if torch.any(torch.isnan(latents)):
@@ -719,9 +674,8 @@ def train(args):
                 target = noise - latents
 
                 # calculate loss
-                loss = train_util.conditional_loss(
-                    model_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=None
-                )
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+                loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if weighting is not None:
                     loss = loss * weighting
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -757,6 +711,7 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                optimizer_eval_fn()
                 flux_train_utils.sample_images(
                     accelerator, args, None, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs
                 )
@@ -775,11 +730,12 @@ def train(args):
                             global_step,
                             accelerator.unwrap_model(flux),
                         )
+                optimizer_train_fn()
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
-            if args.logging_dir is not None:
+            if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss}
-                train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=True)
+                optimizer_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=True)
 
                 accelerator.log(logs, step=global_step)
 
@@ -791,12 +747,13 @@ def train(args):
             if global_step >= args.max_train_steps:
                 break
 
-        if args.logging_dir is not None:
+        if len(accelerator.trackers) > 0:
             logs = {"loss/epoch": loss_recorder.moving_average}
             accelerator.log(logs, step=epoch + 1)
 
         accelerator.wait_for_everyone()
 
+        optimizer_eval_fn()
         if args.save_every_n_epochs is not None:
             if accelerator.is_main_process:
                 flux_train_utils.save_flux_model_on_epoch_end_or_stepwise(
@@ -813,15 +770,17 @@ def train(args):
         flux_train_utils.sample_images(
             accelerator, args, epoch + 1, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs
         )
+        optimizer_train_fn()
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:
     flux = accelerator.unwrap_model(flux)
 
     accelerator.end_training()
+    optimizer_eval_fn()
 
     if args.save_state or args.save_state_on_train_end:
-        train_util.save_state_on_train_end(args, accelerator)
+        checkpoint_io.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
 
@@ -834,15 +793,17 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    train_util.add_sd_models_arguments(parser)  # TODO split this
-    train_util.add_dataset_arguments(parser, True, True, True)
-    train_util.add_training_arguments(parser, False)
-    train_util.add_masked_loss_arguments(parser)
+    args_util.add_sd_models_arguments(parser)  # TODO split this
+    sai_model_spec.add_model_spec_arguments(parser)
+    args_util.add_dataset_arguments(parser, True, True, True)
+    args_util.add_training_arguments(parser, False)
+    args_util.add_masked_loss_arguments(parser)
     deepspeed_utils.add_deepspeed_arguments(parser)
-    train_util.add_sd_saving_arguments(parser)
-    train_util.add_optimizer_arguments(parser)
+    args_util.add_sd_saving_arguments(parser)
+    args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     add_custom_train_arguments(parser)  # TODO remove this from here
+    args_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
 
     parser.add_argument(
@@ -865,27 +826,19 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip_latents_validity_check",
         action="store_true",
-        help="skip latents validity check / latentsの正当性チェックをスキップする",
+        help="[Deprecated] use 'skip_cache_check' instead / 代わりに 'skip_cache_check' を使用してください",
     )
     parser.add_argument(
         "--double_blocks_to_swap",
         type=int,
         default=None,
-        help="[EXPERIMENTAL] "
-        "Sets the number of 'double_blocks' (~640MB) to swap during the forward and backward passes."
-        "Increasing this number lowers the overall VRAM used during training at the expense of training speed (s/it)."
-        " / 順伝播および逆伝播中にスワップする'変換ブロック'（約640MB）の数を設定します。"
-        "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
+        help="[Deprecated] use 'blocks_to_swap' instead / 代わりに 'blocks_to_swap' を使用してください",
     )
     parser.add_argument(
         "--single_blocks_to_swap",
         type=int,
         default=None,
-        help="[EXPERIMENTAL] "
-        "Sets the number of 'single_blocks' (~320MB) to swap during the forward and backward passes."
-        "Increasing this number lowers the overall VRAM used during training at the expense of training speed (s/it)."
-        " / 順伝播および逆伝播中にスワップする'変換ブロック'（約320MB）の数を設定します。"
-        "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
+        help="[Deprecated] use 'blocks_to_swap' instead / 代わりに 'blocks_to_swap' を使用してください",
     )
     parser.add_argument(
         "--cpu_offload_checkpointing",
@@ -899,7 +852,7 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
     train(args)

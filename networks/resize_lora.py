@@ -9,7 +9,7 @@ from safetensors.torch import load_file, save_file, safe_open
 from tqdm import tqdm
 import numpy as np
 
-from library import train_util
+import library.model_io as model_io
 from library import model_util
 from library.utils import setup_logging
 
@@ -19,6 +19,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 MIN_SV = 1e-6
+
+LORA_DOWN_UP_FORMATS = [
+    ("lora_down", "lora_up"),  # sd-scripts LoRA
+    ("lora_A", "lora_B"),  # PEFT LoRA
+    ("down", "up"),  # ControlLoRA
+]
+
 
 # Model save and load functions
 
@@ -39,12 +46,7 @@ def load_state_dict(file_name, dtype):
     return sd, metadata
 
 
-def save_to_file(file_name, state_dict, dtype, metadata):
-    if dtype is not None:
-        for key in list(state_dict.keys()):
-            if type(state_dict[key]) == torch.Tensor:
-                state_dict[key] = state_dict[key].to(dtype)
-
+def save_to_file(file_name, state_dict, metadata):
     if model_util.is_safetensors(file_name):
         save_file(state_dict, file_name, metadata)
     else:
@@ -57,8 +59,8 @@ def save_to_file(file_name, state_dict, dtype, metadata):
 def index_sv_cumulative(S, target):
     original_sum = float(torch.sum(S))
     cumulative_sums = torch.cumsum(S, dim=0) / original_sum
-    index = int(torch.searchsorted(cumulative_sums, target)) + 1
-    index = max(1, min(index, len(S) - 1))
+    index = int(torch.searchsorted(cumulative_sums, target))
+    index = max(0, min(index, len(S) - 1))
 
     return index
 
@@ -67,8 +69,8 @@ def index_sv_fro(S, target):
     S_squared = S.pow(2)
     S_fro_sq = float(torch.sum(S_squared))
     sum_S_squared = torch.cumsum(S_squared, dim=0) / S_fro_sq
-    index = int(torch.searchsorted(sum_S_squared, target**2)) + 1
-    index = max(1, min(index, len(S) - 1))
+    index = int(torch.searchsorted(sum_S_squared, target**2))
+    index = max(0, min(index, len(S) - 1))
 
     return index
 
@@ -76,16 +78,23 @@ def index_sv_fro(S, target):
 def index_sv_ratio(S, target):
     max_sv = S[0]
     min_sv = max_sv / target
-    index = int(torch.sum(S > min_sv).item())
-    index = max(1, min(index, len(S) - 1))
+    index = int(torch.sum(S > min_sv).item()) - 1
+    index = max(0, min(index, len(S) - 1))
 
     return index
 
 
 # Modified from Kohaku-blueleaf's extract/merge functions
-def extract_conv(weight, lora_rank, dynamic_method, dynamic_param, device, scale=1):
+def extract_conv(weight, lora_rank, dynamic_method, dynamic_param, device, scale=1, svd_lowrank_niter=2):
     out_size, in_size, kernel_size, _ = weight.size()
-    U, S, Vh = torch.linalg.svd(weight.reshape(out_size, -1).to(device))
+    weight = weight.reshape(out_size, -1)
+    _in_size = in_size * kernel_size * kernel_size
+
+    if svd_lowrank_niter > 0 and out_size > 2048 and _in_size > 2048:
+        U, S, V = torch.svd_lowrank(weight.to(device), q=min(2 * lora_rank, out_size, _in_size), niter=svd_lowrank_niter)
+        Vh = V.T
+    else:
+        U, S, Vh = torch.linalg.svd(weight.to(device))
 
     param_dict = rank_resize(S, lora_rank, dynamic_method, dynamic_param, scale)
     lora_rank = param_dict["new_rank"]
@@ -101,10 +110,14 @@ def extract_conv(weight, lora_rank, dynamic_method, dynamic_param, device, scale
     return param_dict
 
 
-def extract_linear(weight, lora_rank, dynamic_method, dynamic_param, device, scale=1):
+def extract_linear(weight, lora_rank, dynamic_method, dynamic_param, device, scale=1, svd_lowrank_niter=2):
     out_size, in_size = weight.size()
 
-    U, S, Vh = torch.linalg.svd(weight.to(device))
+    if svd_lowrank_niter > 0 and out_size > 2048 and in_size > 2048:
+        U, S, V = torch.svd_lowrank(weight.to(device), q=min(2 * lora_rank, out_size, in_size), niter=svd_lowrank_niter)
+        Vh = V.T
+    else:
+        U, S, Vh = torch.linalg.svd(weight.to(device))
 
     param_dict = rank_resize(S, lora_rank, dynamic_method, dynamic_param, scale)
     lora_rank = param_dict["new_rank"]
@@ -196,24 +209,10 @@ def rank_resize(S, rank, dynamic_method, dynamic_param, scale=1):
     return param_dict
 
 
-def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dynamic_method, dynamic_param, verbose):
-    network_alpha = None
-    network_dim = None
-    verbose_str = "\n"
+def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dynamic_method, dynamic_param, verbose, svd_lowrank_niter=2):
+    max_old_rank = None
+    new_alpha = None
     fro_list = []
-
-    # Extract loaded lora dim and alpha
-    for key, value in lora_sd.items():
-        if network_alpha is None and "alpha" in key:
-            network_alpha = value
-        if network_dim is None and "lora_down" in key and len(value.size()) == 2:
-            network_dim = value.size()[0]
-        if network_alpha is not None and network_dim is not None:
-            break
-        if network_alpha is None:
-            network_alpha = network_dim
-
-    scale = network_alpha / network_dim
 
     if dynamic_method:
         logger.info(
@@ -229,17 +228,33 @@ def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dyna
 
     with torch.no_grad():
         for key, value in tqdm(lora_sd.items()):
-            weight_name = None
-            if "lora_down" in key:
-                block_down_name = key.rsplit(".lora_down", 1)[0]
-                weight_name = key.rsplit(".", 1)[-1]
-                lora_down_weight = value
-            else:
+            key_parts = key.split(".")
+            block_down_name = None
+            for _format in LORA_DOWN_UP_FORMATS:
+                # Currently we only match lora_down_name in the last two parts of key
+                # because ("down", "up") are general words and may appear in block_down_name
+                if len(key_parts) >= 2 and _format[0] == key_parts[-2]:
+                    block_down_name = ".".join(key_parts[:-2])
+                    lora_down_name = "." + _format[0]
+                    lora_up_name = "." + _format[1]
+                    weight_name = "." + key_parts[-1]
+                    break
+                if len(key_parts) >= 1 and _format[0] == key_parts[-1]:
+                    block_down_name = ".".join(key_parts[:-1])
+                    lora_down_name = "." + _format[0]
+                    lora_up_name = "." + _format[1]
+                    weight_name = ""
+                    break
+
+            if block_down_name is None:
+                # This parameter is not lora_down
                 continue
 
-            # find corresponding lora_up and alpha
+            # Now weight_name can be ".weight" or ""
+            # Find corresponding lora_up and alpha
             block_up_name = block_down_name
-            lora_up_weight = lora_sd.get(block_up_name + ".lora_up." + weight_name, None)
+            lora_down_weight = value
+            lora_up_weight = lora_sd.get(block_up_name + lora_up_name + weight_name, None)
             lora_alpha = lora_sd.get(block_down_name + ".alpha", None)
 
             weights_loaded = lora_down_weight is not None and lora_up_weight is not None
@@ -247,17 +262,20 @@ def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dyna
             if weights_loaded:
 
                 conv2d = len(lora_down_weight.size()) == 4
+                old_rank = lora_down_weight.size()[0]
+                max_old_rank = max(max_old_rank or 0, old_rank)
+
                 if lora_alpha is None:
                     scale = 1.0
                 else:
-                    scale = lora_alpha / lora_down_weight.size()[0]
+                    scale = lora_alpha / old_rank
 
                 if conv2d:
                     full_weight_matrix = merge_conv(lora_down_weight, lora_up_weight, device)
-                    param_dict = extract_conv(full_weight_matrix, new_conv_rank, dynamic_method, dynamic_param, device, scale)
+                    param_dict = extract_conv(full_weight_matrix, new_conv_rank, dynamic_method, dynamic_param, device, scale, svd_lowrank_niter)
                 else:
                     full_weight_matrix = merge_linear(lora_down_weight, lora_up_weight, device)
-                    param_dict = extract_linear(full_weight_matrix, new_rank, dynamic_method, dynamic_param, device, scale)
+                    param_dict = extract_linear(full_weight_matrix, new_rank, dynamic_method, dynamic_param, device, scale, svd_lowrank_niter)
 
                 if verbose:
                     max_ratio = param_dict["max_ratio"]
@@ -266,20 +284,18 @@ def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dyna
                     if not np.isnan(fro_retained):
                         fro_list.append(float(fro_retained))
 
-                    verbose_str += f"{block_down_name:75} | "
+                    verbose_str = f"{block_down_name:75} | "
                     verbose_str += (
                         f"sum(S) retained: {sum_retained:.1%}, fro retained: {fro_retained:.1%}, max(S) ratio: {max_ratio:0.1f}"
                     )
-
-                if verbose and dynamic_method:
-                    verbose_str += f", dynamic | dim: {param_dict['new_rank']}, alpha: {param_dict['new_alpha']}\n"
-                else:
-                    verbose_str += "\n"
+                    if dynamic_method:
+                        verbose_str += f", dynamic | dim: {param_dict['new_rank']}, alpha: {param_dict['new_alpha']}"
+                    tqdm.write(verbose_str)
 
                 new_alpha = param_dict["new_alpha"]
-                o_lora_sd[block_down_name + "." + "lora_down.weight"] = param_dict["lora_down"].to(save_dtype).contiguous()
-                o_lora_sd[block_up_name + "." + "lora_up.weight"] = param_dict["lora_up"].to(save_dtype).contiguous()
-                o_lora_sd[block_up_name + "." "alpha"] = torch.tensor(param_dict["new_alpha"]).to(save_dtype)
+                o_lora_sd[block_down_name + lora_down_name + weight_name] = param_dict["lora_down"].to(save_dtype).contiguous()
+                o_lora_sd[block_up_name + lora_up_name + weight_name] = param_dict["lora_up"].to(save_dtype).contiguous()
+                o_lora_sd[block_down_name + ".alpha"] = torch.tensor(param_dict["new_alpha"]).to(save_dtype)
 
                 block_down_name = None
                 block_up_name = None
@@ -289,10 +305,9 @@ def resize_lora_model(lora_sd, new_rank, new_conv_rank, save_dtype, device, dyna
                 del param_dict
 
     if verbose:
-        print(verbose_str)
         print(f"Average Frobenius norm retention: {np.mean(fro_list):.2%} | std: {np.std(fro_list):0.3f}")
     logger.info("resizing complete")
-    return o_lora_sd, network_dim, new_alpha
+    return o_lora_sd, max_old_rank, new_alpha
 
 
 def resize(args):
@@ -328,7 +343,7 @@ def resize(args):
 
     logger.info("Resizing Lora...")
     state_dict, old_dim, new_alpha = resize_lora_model(
-        lora_sd, args.new_rank, args.new_conv_rank, save_dtype, args.device, args.dynamic_method, args.dynamic_param, args.verbose
+        lora_sd, args.new_rank, args.new_conv_rank, save_dtype, args.device, args.dynamic_method, args.dynamic_param, args.verbose, args.svd_lowrank_niter
     )
 
     # update metadata
@@ -349,12 +364,18 @@ def resize(args):
         metadata["ss_network_dim"] = "Dynamic"
         metadata["ss_network_alpha"] = "Dynamic"
 
-    model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
+    # cast to save_dtype before calculating hashes
+    for key in list(state_dict.keys()):
+        value = state_dict[key]
+        if type(value) == torch.Tensor and value.dtype.is_floating_point and value.dtype != save_dtype:
+            state_dict[key] = value.to(save_dtype)
+
+    model_hash, legacy_hash = model_io.precalculate_safetensors_hashes(state_dict, metadata)
     metadata["sshs_model_hash"] = model_hash
     metadata["sshs_legacy_hash"] = legacy_hash
 
     logger.info(f"saving model to: {args.save_to}")
-    save_to_file(args.save_to, state_dict, save_dtype, metadata)
+    save_to_file(args.save_to, state_dict, metadata)
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -400,6 +421,13 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Specify dynamic resizing method, --new_rank is used as a hard limit for max rank",
     )
     parser.add_argument("--dynamic_param", type=float, default=None, help="Specify target for dynamic reduction")
+    parser.add_argument(
+        "--svd_lowrank_niter",
+        type=int,
+        default=2,
+        help="Number of iterations for svd_lowrank on large matrices (>2048 dims). 0 to disable and use full SVD"
+        " / 大行列(2048次元超)に対するsvd_lowrankの反復回数。0で無効化し完全SVDを使用",
+    )
 
     return parser
 

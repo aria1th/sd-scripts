@@ -2,11 +2,15 @@
 # license: Apache-2.0 License
 
 
-from dataclasses import dataclass
 import math
-from typing import Optional
+import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Union
 
-from library.device_utils import init_ipex, clean_memory_on_device
+from library import utils
+from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
 
@@ -14,6 +18,8 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
+
+from library import custom_offloading_utils
 
 # USE_REENTRANT = True
 
@@ -917,8 +923,15 @@ class Flux(nn.Module):
 
         self.gradient_checkpointing = False
         self.cpu_offload_checkpointing = False
-        self.double_blocks_to_swap = None
-        self.single_blocks_to_swap = None
+        self.blocks_to_swap = None
+
+        self.offloader_double = None
+        self.offloader_single = None
+        self.num_double_blocks = len(self.double_blocks)
+        self.num_single_blocks = len(self.single_blocks)
+
+    def get_model_type(self) -> str:
+        return "flux"
 
     @property
     def device(self):
@@ -956,39 +969,48 @@ class Flux(nn.Module):
 
         print("FLUX: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, double_blocks: Optional[int], single_blocks: Optional[int]):
-        self.double_blocks_to_swap = double_blocks
-        self.single_blocks_to_swap = single_blocks
+    def enable_block_swap(self, num_blocks: int, device: torch.device):
+        self.blocks_to_swap = num_blocks
+        double_blocks_to_swap = num_blocks // 2
+        single_blocks_to_swap = (num_blocks - double_blocks_to_swap) * 2
+
+        assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
+            f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
+            f"Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks."
+        )
+
+        self.offloader_double = custom_offloading_utils.ModelOffloader(
+            self.double_blocks, double_blocks_to_swap, device  # , debug=True
+        )
+        self.offloader_single = custom_offloading_utils.ModelOffloader(
+            self.single_blocks, single_blocks_to_swap, device  # , debug=True
+        )
+        print(
+            f"FLUX: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
+        )
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
-        # assume model is on cpu
-        if self.double_blocks_to_swap:
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
             save_double_blocks = self.double_blocks
-            self.double_blocks = None
-        if self.single_blocks_to_swap:
             save_single_blocks = self.single_blocks
+            self.double_blocks = None
             self.single_blocks = None
 
         self.to(device)
 
-        if self.double_blocks_to_swap:
+        if self.blocks_to_swap:
             self.double_blocks = save_double_blocks
-        if self.single_blocks_to_swap:
             self.single_blocks = save_single_blocks
 
     def prepare_block_swap_before_forward(self):
-        # move last n blocks to cpu: they are on cuda
-        if self.double_blocks_to_swap:
-            for i in range(len(self.double_blocks) - self.double_blocks_to_swap):
-                self.double_blocks[i].to(self.device)
-            for i in range(len(self.double_blocks) - self.double_blocks_to_swap, len(self.double_blocks)):
-                self.double_blocks[i].to("cpu")  # , non_blocking=True)
-        if self.single_blocks_to_swap:
-            for i in range(len(self.single_blocks) - self.single_blocks_to_swap):
-                self.single_blocks[i].to(self.device)
-            for i in range(len(self.single_blocks) - self.single_blocks_to_swap, len(self.single_blocks)):
-                self.single_blocks[i].to("cpu")  # , non_blocking=True)
-        clean_memory_on_device(self.device)
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
+        self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
+
+    def get_mod_vectors(self, timesteps: Tensor, guidance: Tensor | None = None, batch_size: int | None = None) -> Tensor:
+        return None  # FLUX.1 does not use mod_vectors, but Chroma does.
 
     def forward(
         self,
@@ -998,8 +1020,11 @@ class Flux(nn.Module):
         txt_ids: Tensor,
         timesteps: Tensor,
         y: Tensor,
+        block_controlnet_hidden_states=None,
+        block_controlnet_single_hidden_states=None,
         guidance: Tensor | None = None,
         txt_attention_mask: Tensor | None = None,
+        mod_vectors: Tensor | None = None,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -1016,70 +1041,42 @@ class Flux(nn.Module):
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
+        if block_controlnet_hidden_states is not None:
+            controlnet_depth = len(block_controlnet_hidden_states)
+        if block_controlnet_single_hidden_states is not None:
+            controlnet_single_depth = len(block_controlnet_single_hidden_states)
 
-        if not self.double_blocks_to_swap:
-            for block in self.double_blocks:
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
-        else:
-            # make sure first n blocks are on cuda, and last n blocks are on cpu at beginning
-            for block_idx in range(self.double_blocks_to_swap):
-                block = self.double_blocks[len(self.double_blocks) - self.double_blocks_to_swap + block_idx]
-                if block.parameters().__next__().device.type != "cpu":
-                    block.to("cpu")  # , non_blocking=True)
-                    # print(f"Moved double block {len(self.double_blocks) - self.double_blocks_to_swap + block_idx} to cpu.")
-
-                block = self.double_blocks[block_idx]
-                if block.parameters().__next__().device.type == "cpu":
-                    block.to(self.device)
-                    # print(f"Moved double block {block_idx} to cuda.")
-
-            to_cpu_block_index = 0
+        if not self.blocks_to_swap:
             for block_idx, block in enumerate(self.double_blocks):
-                # move last n blocks to cuda: they are on cpu, and move first n blocks to cpu: they are on cuda
-                moving = block_idx >= len(self.double_blocks) - self.double_blocks_to_swap
-                if moving:
-                    block.to(self.device)  # move to cuda
-                    # print(f"Moved double block {block_idx} to cuda.")
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                if block_controlnet_hidden_states is not None and controlnet_depth > 0:
+                    img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
+
+            img = torch.cat((txt, img), 1)
+            for block_idx, block in enumerate(self.single_blocks):
+                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
+                    img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
+        else:
+            for block_idx, block in enumerate(self.double_blocks):
+                self.offloader_double.wait_for_block(block_idx)
 
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                if block_controlnet_hidden_states is not None and controlnet_depth > 0:
+                    img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
 
-                if moving:
-                    self.double_blocks[to_cpu_block_index].to("cpu")  # , non_blocking=True)
-                    # print(f"Moved double block {to_cpu_block_index} to cpu.")
-                    to_cpu_block_index += 1
+                self.offloader_double.submit_move_blocks(self.double_blocks, block_idx)
 
-        img = torch.cat((txt, img), 1)
+            img = torch.cat((txt, img), 1)
 
-        if not self.single_blocks_to_swap:
-            for block in self.single_blocks:
-                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
-        else:
-            # make sure first n blocks are on cuda, and last n blocks are on cpu at beginning
-            for block_idx in range(self.single_blocks_to_swap):
-                block = self.single_blocks[len(self.single_blocks) - self.single_blocks_to_swap + block_idx]
-                if block.parameters().__next__().device.type != "cpu":
-                    block.to("cpu")  # , non_blocking=True)
-                    # print(f"Moved single block {len(self.single_blocks) - self.single_blocks_to_swap + block_idx} to cpu.")
-
-                block = self.single_blocks[block_idx]
-                if block.parameters().__next__().device.type == "cpu":
-                    block.to(self.device)
-                    # print(f"Moved single block {block_idx} to cuda.")
-
-            to_cpu_block_index = 0
             for block_idx, block in enumerate(self.single_blocks):
-                # move last n blocks to cuda: they are on cpu, and move first n blocks to cpu: they are on cuda
-                moving = block_idx >= len(self.single_blocks) - self.single_blocks_to_swap
-                if moving:
-                    block.to(self.device)  # move to cuda
-                    # print(f"Moved single block {block_idx} to cuda.")
+                self.offloader_single.wait_for_block(block_idx)
 
                 img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
+                    img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
 
-                if moving:
-                    self.single_blocks[to_cpu_block_index].to("cpu")  # , non_blocking=True)
-                    # print(f"Moved single block {to_cpu_block_index} to cpu.")
-                    to_cpu_block_index += 1
+                self.offloader_single.submit_move_blocks(self.single_blocks, block_idx)
 
         img = img[:, txt.shape[1] :, ...]
 
@@ -1088,15 +1085,22 @@ class Flux(nn.Module):
             vec = vec.to(self.device)
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+
         return img
 
 
-class FluxUpper(nn.Module):
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
+class ControlNetFlux(nn.Module):
     """
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, params: FluxParams):
+    def __init__(self, params: FluxParams, controlnet_depth=2, controlnet_single_depth=0):
         super().__init__()
 
         self.params = params
@@ -1124,11 +1128,56 @@ class FluxUpper(nn.Module):
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
                 )
-                for _ in range(params.depth)
+                for _ in range(controlnet_depth)
+            ]
+        )
+
+        self.single_blocks = nn.ModuleList(
+            [
+                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
+                for _ in range(controlnet_single_depth)
             ]
         )
 
         self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+        self.blocks_to_swap = None
+
+        self.offloader_double = None
+        self.offloader_single = None
+        self.num_double_blocks = len(self.double_blocks)
+        self.num_single_blocks = len(self.single_blocks)
+
+        # add ControlNet blocks
+        self.controlnet_blocks = nn.ModuleList([])
+        for _ in range(controlnet_depth):
+            controlnet_block = nn.Linear(self.hidden_size, self.hidden_size)
+            controlnet_block = zero_module(controlnet_block)
+            self.controlnet_blocks.append(controlnet_block)
+        self.controlnet_blocks_for_single = nn.ModuleList([])
+        for _ in range(controlnet_single_depth):
+            controlnet_block = nn.Linear(self.hidden_size, self.hidden_size)
+            controlnet_block = zero_module(controlnet_block)
+            self.controlnet_blocks_for_single.append(controlnet_block)
+        self.pos_embed_input = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.gradient_checkpointing = False
+        self.input_hint_block = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1, stride=2),
+            nn.SiLU(),
+            zero_module(nn.Conv2d(16, 16, 3, padding=1)),
+        )
 
     @property
     def device(self):
@@ -1138,48 +1187,95 @@ class FluxUpper(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
         self.gradient_checkpointing = True
+        self.cpu_offload_checkpointing = cpu_offload
 
         self.time_in.enable_gradient_checkpointing()
         self.vector_in.enable_gradient_checkpointing()
         if self.guidance_in.__class__ != nn.Identity:
             self.guidance_in.enable_gradient_checkpointing()
 
-        for block in self.double_blocks:
-            block.enable_gradient_checkpointing()
+        for block in self.double_blocks + self.single_blocks:
+            block.enable_gradient_checkpointing(cpu_offload=cpu_offload)
 
-        print("FLUX: Gradient checkpointing enabled.")
+        print(f"FLUX: Gradient checkpointing enabled. CPU offload: {cpu_offload}")
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
 
         self.time_in.disable_gradient_checkpointing()
         self.vector_in.disable_gradient_checkpointing()
         if self.guidance_in.__class__ != nn.Identity:
             self.guidance_in.disable_gradient_checkpointing()
 
-        for block in self.double_blocks:
+        for block in self.double_blocks + self.single_blocks:
             block.disable_gradient_checkpointing()
 
         print("FLUX: Gradient checkpointing disabled.")
+
+    def enable_block_swap(self, num_blocks: int, device: torch.device):
+        self.blocks_to_swap = num_blocks
+        double_blocks_to_swap = num_blocks // 2
+        single_blocks_to_swap = (num_blocks - double_blocks_to_swap) * 2
+
+        assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
+            f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
+            f"Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks."
+        )
+
+        self.offloader_double = custom_offloading_utils.ModelOffloader(
+            self.double_blocks, double_blocks_to_swap, device  # , debug=True
+        )
+        self.offloader_single = custom_offloading_utils.ModelOffloader(
+            self.single_blocks,  single_blocks_to_swap, device  # , debug=True
+        )
+        print(
+            f"FLUX: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        if self.blocks_to_swap:
+            save_double_blocks = self.double_blocks
+            save_single_blocks = self.single_blocks
+            self.double_blocks = nn.ModuleList()
+            self.single_blocks = nn.ModuleList()
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.double_blocks = save_double_blocks
+            self.single_blocks = save_single_blocks
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
+        self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
 
     def forward(
         self,
         img: Tensor,
         img_ids: Tensor,
+        controlnet_cond: Tensor,
         txt: Tensor,
         txt_ids: Tensor,
         timesteps: Tensor,
         y: Tensor,
         guidance: Tensor | None = None,
         txt_attention_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> tuple[tuple[Tensor]]:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
         # running on sequences img
         img = self.img_in(img)
+        controlnet_cond = self.input_hint_block(controlnet_cond)
+        controlnet_cond = rearrange(controlnet_cond, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        controlnet_cond = self.pos_embed_input(controlnet_cond)
+        img = img + controlnet_cond
         vec = self.time_in(timestep_embedding(timesteps, 256))
         if self.params.guidance_embed:
             if guidance is None:
@@ -1191,70 +1287,43 @@ class FluxUpper(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+        block_samples = ()
+        block_single_samples = ()
+        if not self.blocks_to_swap:
+            for block in self.double_blocks:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                block_samples = block_samples + (img,)
 
-        return img, txt, vec, pe
+            img = torch.cat((txt, img), 1)
+            for block in self.single_blocks:
+                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                block_single_samples = block_single_samples + (img,)
+        else:
+            for block_idx, block in enumerate(self.double_blocks):
+                self.offloader_double.wait_for_block(block_idx)
 
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                block_samples = block_samples + (img,)
 
-class FluxLower(nn.Module):
-    """
-    Transformer model for flow matching on sequences.
-    """
+                self.offloader_double.submit_move_blocks(self.double_blocks, block_idx)
 
-    def __init__(self, params: FluxParams):
-        super().__init__()
-        self.hidden_size = params.hidden_size
-        self.num_heads = params.num_heads
-        self.out_channels = params.in_channels
+            img = torch.cat((txt, img), 1)
 
-        self.single_blocks = nn.ModuleList(
-            [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
-                for _ in range(params.depth_single_blocks)
-            ]
-        )
+            for block_idx, block in enumerate(self.single_blocks):
+                self.offloader_single.wait_for_block(block_idx)
 
-        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                block_single_samples = block_single_samples + (img,)
 
-        self.gradient_checkpointing = False
+                self.offloader_single.submit_move_blocks(self.single_blocks, block_idx)
 
-    @property
-    def device(self):
-        return next(self.parameters()).device
+        controlnet_block_samples = ()
+        controlnet_single_block_samples = ()
+        for block_sample, controlnet_block in zip(block_samples, self.controlnet_blocks):
+            block_sample = controlnet_block(block_sample)
+            controlnet_block_samples = controlnet_block_samples + (block_sample,)
+        for block_sample, controlnet_block in zip(block_samples, self.controlnet_blocks_for_single):
+            block_sample = controlnet_block(block_sample)
+            controlnet_single_block_samples = controlnet_single_block_samples + (block_sample,)
 
-    @property
-    def dtype(self):
-        return next(self.parameters()).dtype
-
-    def enable_gradient_checkpointing(self):
-        self.gradient_checkpointing = True
-
-        for block in self.single_blocks:
-            block.enable_gradient_checkpointing()
-
-        print("FLUX: Gradient checkpointing enabled.")
-
-    def disable_gradient_checkpointing(self):
-        self.gradient_checkpointing = False
-
-        for block in self.single_blocks:
-            block.disable_gradient_checkpointing()
-
-        print("FLUX: Gradient checkpointing disabled.")
-
-    def forward(
-        self,
-        img: Tensor,
-        txt: Tensor,
-        vec: Tensor | None = None,
-        pe: Tensor | None = None,
-        txt_attention_mask: Tensor | None = None,
-    ) -> Tensor:
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
-        img = img[:, txt.shape[1] :, ...]
-
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        return img
+        return controlnet_block_samples, controlnet_single_block_samples

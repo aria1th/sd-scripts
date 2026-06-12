@@ -10,15 +10,23 @@ import PIL.Image
 import torch
 from packaging import version
 from tqdm import tqdm
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPImageProcessor as CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 from diffusers import SchedulerMixin, StableDiffusionPipeline
-from diffusers.models import AutoencoderKL, UNet2DConditionModel
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
+from diffusers.models import AutoencoderKL
+from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from diffusers.utils import logging
 from PIL import Image
 
-from library import sdxl_model_util, sdxl_train_util, train_util
+from library import (
+    sdxl_model_util,
+    sdxl_train_util,
+    strategy_base,
+    strategy_sdxl,
+    sdxl_original_unet,
+    sdxl_original_control_net,
+)
+from library.hidden_states import pool_workaround
 
 
 try:
@@ -221,7 +229,7 @@ def get_hidden_states(text_encoder, input_ids, is_sdxl_text_encoder2: bool, eos_
         enc_out = text_encoder(input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=True)
         hidden_states = enc_out["hidden_states"][-2]  # penuultimate layer
         # pool = enc_out["text_embeds"]
-        pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
+        pool = pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
     hidden_states = hidden_states.to(device)
     if pool is not None:
         pool = pool.to(device)
@@ -537,7 +545,7 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         vae: AutoencoderKL,
         text_encoder: List[CLIPTextModel],
         tokenizer: List[CLIPTokenizer],
-        unet: UNet2DConditionModel,
+        unet: Union[sdxl_original_unet.SdxlUNet2DConditionModel, sdxl_original_control_net.SdxlControlledUNet],
         scheduler: SchedulerMixin,
         # clip_skip: int,
         safety_checker: StableDiffusionSafetyChecker,
@@ -593,74 +601,6 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             ):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
-
-    def _encode_prompt(
-        self,
-        prompt,
-        device,
-        num_images_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt,
-        max_embeddings_multiples,
-        is_sdxl_text_encoder2,
-    ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
-
-        Args:
-            prompt (`str` or `list(int)`):
-                prompt to be encoded
-            device: (`torch.device`):
-                torch device
-            num_images_per_prompt (`int`):
-                number of images that should be generated per prompt
-            do_classifier_free_guidance (`bool`):
-                whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`):
-                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
-                if `guidance_scale` is less than `1`).
-            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
-                The max multiple length of prompt embeddings compared to the max output length of text encoder.
-        """
-        batch_size = len(prompt) if isinstance(prompt, list) else 1
-
-        if negative_prompt is None:
-            negative_prompt = [""] * batch_size
-        elif isinstance(negative_prompt, str):
-            negative_prompt = [negative_prompt] * batch_size
-        if batch_size != len(negative_prompt):
-            raise ValueError(
-                f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                " the batch size of `prompt`."
-            )
-
-        text_embeddings, text_pool, uncond_embeddings, uncond_pool = get_weighted_text_embeddings(
-            pipe=self,
-            prompt=prompt,
-            uncond_prompt=negative_prompt if do_classifier_free_guidance else None,
-            max_embeddings_multiples=max_embeddings_multiples,
-            clip_skip=self.clip_skip,
-            is_sdxl_text_encoder2=is_sdxl_text_encoder2,
-        )
-        bs_embed, seq_len, _ = text_embeddings.shape
-        text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)  # ??
-        text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
-        if text_pool is not None:
-            text_pool = text_pool.repeat(1, num_images_per_prompt)
-            text_pool = text_pool.view(bs_embed * num_images_per_prompt, -1)
-
-        if do_classifier_free_guidance:
-            bs_embed, seq_len, _ = uncond_embeddings.shape
-            uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
-            uncond_embeddings = uncond_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
-            if uncond_pool is not None:
-                uncond_pool = uncond_pool.repeat(1, num_images_per_prompt)
-                uncond_pool = uncond_pool.view(bs_embed * num_images_per_prompt, -1)
-
-            return text_embeddings, text_pool, uncond_embeddings, uncond_pool
-
-        return text_embeddings, text_pool, None, None
 
     def check_inputs(self, prompt, height, width, strength, callback_steps):
         if not isinstance(prompt, str) and not isinstance(prompt, list):
@@ -738,7 +678,7 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         if image is None:
             shape = (
                 batch_size,
-                self.unet.in_channels,
+                self.vae.config.latent_channels,  # always 4; unet.in_channels may be 9 for inpainting
                 height // self.vae_scale_factor,
                 width // self.vae_scale_factor,
             )
@@ -792,8 +732,10 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         max_embeddings_multiples: Optional[int] = 3,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        controlnet=None,
+        controlnet: sdxl_original_control_net.SdxlControlNet = None,
         controlnet_image=None,
+        inpaint_image: PIL.Image.Image = None,
+        inpaint_mask: PIL.Image.Image = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         is_cancelled_callback: Optional[Callable[[], bool]] = None,
         callback_steps: int = 1,
@@ -896,32 +838,24 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        # 実装を簡単にするためにtokenzer/text encoderを切り替えて二回呼び出す
-        # To simplify the implementation, switch the tokenzer/text encoder and call it twice
-        text_embeddings_list = []
-        text_pool = None
-        uncond_embeddings_list = []
-        uncond_pool = None
-        for i in range(len(self.tokenizers)):
-            self.tokenizer = self.tokenizers[i]
-            self.text_encoder = self.text_encoders[i]
+        tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy = strategy_base.TokenizeStrategy.get_strategy()
+        encoding_strategy: strategy_sdxl.SdxlTextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-            text_embeddings, tp1, uncond_embeddings, up1 = self._encode_prompt(
-                prompt,
-                device,
-                num_images_per_prompt,
-                do_classifier_free_guidance,
-                negative_prompt,
-                max_embeddings_multiples,
-                is_sdxl_text_encoder2=i == 1,
+        text_input_ids, text_weights = tokenize_strategy.tokenize_with_weights(prompt)
+        hidden_states_1, hidden_states_2, text_pool = encoding_strategy.encode_tokens_with_weights(
+            tokenize_strategy, self.text_encoders, text_input_ids, text_weights
+        )
+        text_embeddings = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
+
+        if do_classifier_free_guidance:
+            input_ids, weights = tokenize_strategy.tokenize_with_weights(negative_prompt or "")
+            hidden_states_1, hidden_states_2, uncond_pool = encoding_strategy.encode_tokens_with_weights(
+                tokenize_strategy, self.text_encoders, input_ids, weights
             )
-            text_embeddings_list.append(text_embeddings)
-            uncond_embeddings_list.append(uncond_embeddings)
-
-            if tp1 is not None:
-                text_pool = tp1
-            if up1 is not None:
-                uncond_pool = up1
+            uncond_embeddings = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
+        else:
+            uncond_embeddings = None
+            uncond_pool = None
 
         unet_dtype = self.unet.dtype
         dtype = unet_dtype
@@ -970,23 +904,53 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # create size embs and concat embeddings for SDXL
-        orig_size = torch.tensor([height, width]).repeat(batch_size * num_images_per_prompt, 1).to(dtype)
+        orig_size = torch.tensor([height, width]).repeat(batch_size * num_images_per_prompt, 1).to(device, dtype)
         crop_size = torch.zeros_like(orig_size)
         target_size = orig_size
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(dtype)
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(device, dtype)
 
         # make conditionings
+        text_pool = text_pool.to(device, dtype)
         if do_classifier_free_guidance:
-            text_embeddings = torch.cat(text_embeddings_list, dim=2)
-            uncond_embeddings = torch.cat(uncond_embeddings_list, dim=2)
-            text_embedding = torch.cat([uncond_embeddings, text_embeddings]).to(dtype)
+            text_embedding = torch.cat([uncond_embeddings, text_embeddings]).to(device, dtype)
 
-            cond_vector = torch.cat([text_pool, embs], dim=1)
-            uncond_vector = torch.cat([uncond_pool, embs], dim=1)
-            vector_embedding = torch.cat([uncond_vector, cond_vector]).to(dtype)
+            uncond_pool = uncond_pool.to(device, dtype)
+            cond_vector = torch.cat([text_pool, embs], dim=1).to(dtype)
+            uncond_vector = torch.cat([uncond_pool, embs], dim=1).to(dtype)
+            vector_embedding = torch.cat([uncond_vector, cond_vector])
         else:
-            text_embedding = torch.cat(text_embeddings_list, dim=2).to(dtype)
-            vector_embedding = torch.cat([text_pool, embs], dim=1).to(dtype)
+            text_embedding = text_embeddings.to(device, dtype)
+            vector_embedding = torch.cat([text_pool, embs], dim=1)
+
+        # Prepare 9-channel inpainting inputs (mask + masked image latents) if supplied.
+        # The scheduler and latents always stay 4-channel; concatenation only happens
+        # on the UNet input (latent_model_input) inside the denoising loop.
+        inpaint_mask_latent = None
+        inpaint_masked_image_latent = None
+        if inpaint_image is not None and inpaint_mask is not None:
+            import numpy as np
+            # Encode masked image: image * (1 - mask).
+            # The VAE may run in a different dtype than the UNet (e.g. fp32 with
+            # --no_half_vae, or bf16 to avoid SDXL's fp16 VAE NaN issue), so cast
+            # to self.vae.dtype here — mirroring the existing decode_latents path
+            # (`self.vae.decode(latents.to(self.vae.dtype))`).
+            img_np = np.array(inpaint_image.convert("RGB")).astype(np.float32) / 127.5 - 1.0
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1)[None].to(device=device, dtype=self.vae.dtype)
+            mask_np = np.array(inpaint_mask.convert("L")).astype(np.float32) / 255.0
+            mask_np = (mask_np >= 0.5).astype(np.float32)
+            mask_t = torch.from_numpy(mask_np)[None, None].to(device=device, dtype=self.vae.dtype)
+            masked_img_t = img_t * (1.0 - mask_t)
+            # Disable autocast: under fp16 autocast (set by accelerator.autocast() in
+            # sampling.sample_image_inference), conv kernels run in fp16 even when
+            # weights/inputs are fp32 — and SDXL VAE produces NaN in fp16. This mirrors
+            # how decode_latents() runs *outside* the autocast block in the caller.
+            with torch.autocast(device_type=device.type, enabled=False):
+                inpaint_masked_image_latent = (
+                    self.vae.encode(masked_img_t).latent_dist.sample() * sdxl_model_util.VAE_SCALE_FACTOR
+                )
+            inpaint_mask_latent = torch.nn.functional.interpolate(
+                mask_t, size=(height // 8, width // 8)
+            )
 
         # 8. Denoising loop
         for i, t in enumerate(self.progress_bar(timesteps)):
@@ -994,22 +958,22 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            unet_additional_args = {}
-            if controlnet is not None:
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=text_embeddings,
-                    controlnet_cond=controlnet_image,
-                    conditioning_scale=1.0,
-                    guess_mode=False,
-                    return_dict=False,
-                )
-                unet_additional_args["down_block_additional_residuals"] = down_block_res_samples
-                unet_additional_args["mid_block_additional_residual"] = mid_block_res_sample
+            # For 9-channel inpainting UNet: concatenate mask and masked-image latents.
+            # Duplicate for CFG the same way latent_model_input was duplicated.
+            if inpaint_mask_latent is not None:
+                n = latent_model_input.shape[0] // latents.shape[0]  # 2 if CFG, else 1
+                mask_in = inpaint_mask_latent.repeat(n, 1, 1, 1).to(latent_model_input.dtype)
+                masked_in = inpaint_masked_image_latent.repeat(n, 1, 1, 1).to(latent_model_input.dtype)
+                latent_model_input = torch.cat([latent_model_input, mask_in, masked_in], dim=1)
+
+            # FIXME SD1 ControlNet is not working
 
             # predict the noise residual
-            noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding)
+            if controlnet is not None:
+                input_resi_add, mid_add = controlnet(latent_model_input, t, text_embedding, vector_embedding, controlnet_image)
+                noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding, input_resi_add, mid_add)
+            else:
+                noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding)
             noise_pred = noise_pred.to(dtype)  # U-Net changes dtype in LoRA training
 
             # perform guidance
